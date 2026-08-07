@@ -1,59 +1,36 @@
-"""Backend database package（FastAPI + 纯 SQLAlchemy 2.x）。
+"""Backend database package（FastAPI + 纯 SQLAlchemy 2.x 同步/异步双模式。
 
-核心导出：
-    # ---- 基础对象 ----
-    Base              : SQLAlchemy 2.x DeclarativeBase（所有 ORM 模型继承它）
-    GenerationRecord  : ORM 模型，表 generation_records
-    TASK_STATUS_PENDING / TASK_STATUS_SUCCESS / TASK_STATUS_FAILED
+统一配置源：backend/config.py（单一 Settings，禁止第二套）。
 
-    # ---- Engine / Session 工厂 ----
-    make_engine(settings, /)           : 从 Settings 构造 SQLAlchemy Engine（连接池）
-    make_session_factory(engine, /)    : 从 Engine 构造 sessionmaker(bind=engine)
-    init_database(settings, engine=None)
-                                       : 幂等初始化：MySQL 时先建库，再 metadata.create_all(engine)
+同步（B 的同步路由 / CLI / 测试）：
+    from backend.db import get_db, create_pending, mark_success, mark_failed
+    from fastapi import Depends
+    @router.post("/generations")
+    def create_task(db: Session = Depends(get_db)): ...
 
-    # ---- FastAPI 依赖注入（Depends） ----
-    get_session_factory(settings)  -> sessionmaker
-    get_db(session_factory)        -> Generator[Session, None, None]
-                                       : 标准 FastAPI yield Session 依赖
+异步（B 的 async 路由）：
+    from backend.db import async_get_db, acreate_pending, amark_success, amark_failed
+    @router.post("/generations")
+    async def create_task(db: AsyncSession = Depends(async_get_db)): ...
 
-    # ---- 给成员 B 的稳定 Repository API（第一个参数都是显式 Session） ----
-    create_pending(db, /, image_path=None, user_input=None, image_description=None)
-    mark_success(db, /, task_id, title, content, tags, image_description=None)
-    mark_failed(db, /, task_id, error_code, error_message, image_description=None)
-    get_record(db, /, task_id)
-    list_records(db, /, status=None, limit=100)
+字段映射（B 已与 A 对齐）：
+    image_summary  -> DB image_description
+    body           -> DB content
+    两个别名在 Repository 层都接受。
 
-    # ---- 便捷版（当你已经用 Settings / 默认 Settings 初始化了全局单例） ----
-    # 下面每个函数都和上面签名一样，只是省略第一个 db 参数；内部用 global _global_session_factory
-    # 注意：必须先调用 init_database(settings) 或 set_global_session_factory(...) 才能用这些便捷版。
-    init_database_global(settings, engine=None)
-    set_global_session_factory(session_factory)
-    close_global_engine_session()
-    create_pending_g(...)
-    mark_success_g(...)
-    mark_failed_g(...)
-    get_record_g(...)
-    list_records_g(...)
+generation_id（task_id）：
+    只生成一次 uuid.uuid4()（B 的标准 UUID），写入 DB 前不会重复生成。
 
-为什么第一个参数都是显式 Session：
-    这样 FastAPI 路由层可以统一由 Depends(get_db) 注入同一个 session 完成事务，
-    也方便测试时自行构造 session（用临时 SQLite、临时 MySQL schema），
-    完全不依赖 Flask / app context，纯 SQLAlchemy 2.x 用法。
-
-校验规则：
-    mark_success() 在写入前强制调用 validate_copy()（标题≤20 / 正文非空 / 描述非空 /
-    标签 3~5 个 去重补 #），不合规直接抛 BusinessException(VALIDATION_ERROR)，
-    不写脏数据到数据库。
+写库函数异常：先 rollback()，再抛 BusinessException（避免事务泄漏。
 """
 from __future__ import annotations
 
-import json
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 from datetime import datetime
 from typing import (
     Any,
+    AsyncGenerator,
     Dict,
     Generator,
     Iterable,
@@ -79,16 +56,29 @@ try:
         Session,
         mapped_column,
         sessionmaker,
+        close_all_sessions,
     )
 except ImportError as e:  # pragma: no cover
     raise SystemExit(
-        "缺少依赖：SQLAlchemy>=2.0, PyMySQL>=1.1。请先运行：pip install -r requirements.txt"
+        "缺少依赖：SQLAlchemy>=2.0.25, PyMySQL>=1.1。请先运行：pip install -r requirements.txt"
     ) from e
 
+try:
+    from sqlalchemy.ext.asyncio import (
+        AsyncEngine,
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+except ImportError:  # pragma: no cover - 同步模式不一定需要 async extra
+    AsyncEngine = None  # type: ignore
+    AsyncSession = None  # type: ignore
+    async_sessionmaker = None  # type: ignore
+    create_async_engine = None  # type: ignore
 
+from ..config import Settings, build_database_url, get_settings, mask_database_url, parse_mysql_url
 from ..schemas import BusinessException, ErrorCode
 from ..validation import validate_copy
-from .config import Settings, get_settings, mask_database_url, parse_mysql_url
 
 
 TASK_STATUS_PENDING = "pending"
@@ -96,9 +86,11 @@ TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_FAILED = "failed"
 
 
-class Base(DeclarativeBase):
-    """SQLAlchemy 2.x Declarative Base。用 Base.metadata.create_all(engine) 建表。"""
+# ---------------------------------------------------------------------------
+# ORM Model（同步 & 异步共用）
+# ---------------------------------------------------------------------------
 
+class Base(DeclarativeBase):
     type_annotation_map = {
         Dict[str, Any]: JSON,
         List[str]: JSON,
@@ -112,16 +104,16 @@ class GenerationRecord(Base):
     task_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default=TASK_STATUS_PENDING)
 
-    image_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True, default=None)
-    image_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
-    user_input: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+    image_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    image_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    user_input: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    title: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, default=None)
-    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
-    tags: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True, default=None)
+    title: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tags: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
 
-    error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, default=None)
-    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+    error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now(), default=datetime.utcnow
@@ -148,9 +140,11 @@ class GenerationRecord(Base):
             "status": self.status,
             "image_path": self.image_path,
             "image_description": self.image_description,
+            "image_summary": self.image_description,
             "user_input": self.user_input,
             "title": self.title,
             "content": self.content,
+            "body": self.content,
             "tags": list(self.tags) if self.tags is not None else None,
             "error_code": self.error_code,
             "error_message": self.error_message,
@@ -160,33 +154,23 @@ class GenerationRecord(Base):
 
 
 # ---------------------------------------------------------------------------
-# Engine / Session factory helpers
+# Engine / Session helpers（同步）
 # ---------------------------------------------------------------------------
 
 def make_engine(settings: Settings, /) -> Any:
-    """根据 Settings 构造 SQLAlchemy Engine。
-
-    - SQLite：加 ?check_same_thread=False，保证并行安全
-    - MySQL：启用 utf8mb4，设置 pool_recycle=3600，避免长连接被 MySQL server 断开
-    """
-    url = settings.DATABASE_URL or ""
-    masked_url = mask_database_url(url)
-    connect_args: Dict[str, Any] = {}
+    url = build_database_url(settings)
     if url.startswith("sqlite"):
-        connect_args["check_same_thread"] = False
-        return create_engine(url, connect_args=connect_args, future=True)
+        return create_engine(url, connect_args={"check_same_thread": False}, future=True)
     return create_engine(
         url,
         future=True,
         pool_pre_ping=True,
         pool_recycle=3600,
-        connect_args={"charset": "utf8mb4", **connect_args} if url.startswith("mysql") else connect_args,
         echo=False,
     )
 
 
 def make_session_factory(engine: Any, /) -> sessionmaker[Session]:
-    """从 engine 构造标准 sessionmaker（expire_on_commit=False 方便 to_dict() 后继续用对象）。"""
     return sessionmaker(
         bind=engine,
         autoflush=False,
@@ -197,22 +181,17 @@ def make_session_factory(engine: Any, /) -> sessionmaker[Session]:
 
 
 def _create_mysql_database_if_missing(url: str) -> None:
-    """MySQL 专用：在 SQLAlchemy create_all 之前，用 PyMySQL 先建库（保证库存在）。"""
     parsed = parse_mysql_url(url)
     if not parsed:
         return
     user, password, host, port, database = parsed
     try:
         import pymysql  # type: ignore
-    except ImportError:  # pragma: no cover
+    except ImportError:
         return
     try:
         conn = pymysql.connect(
-            host=host,
-            port=port,
-            user=user,
-            password=password or "",
-            charset="utf8mb4",
+            host=host, port=port, user=user, password=password or "", charset="utf8mb4"
         )
         try:
             with conn.cursor() as cur:
@@ -223,44 +202,41 @@ def _create_mysql_database_if_missing(url: str) -> None:
             conn.commit()
         finally:
             conn.close()
-    except Exception as e:  # pragma: no cover - 真实连接失败交给上层报错
+    except Exception as e:
         raise BusinessException(
             ErrorCode.DATABASE_ERROR,
-            f"创建 MySQL 数据库失败：{e}（连接信息 user={user} host={host} port={port} db={database}）",
+            f"创建 MySQL 数据库失败：{e}（user={user} host={host} port={port} db={database}）",
         )
 
 
-def init_database(settings: Settings, engine: Any = None) -> Tuple[Any, sessionmaker[Session]]:
-    """幂等初始化数据库：建库（MySQL 时） + 建表。
-
-    返回 (engine, session_factory)。
-    """
-    url = settings.DATABASE_URL or ""
+def init_database(
+    settings: Optional[Settings] = None, engine: Any = None
+) -> Tuple[Any, sessionmaker[Session]]:
+    settings = settings or get_settings()
+    url = build_database_url(settings)
     if url.startswith("mysql"):
         _create_mysql_database_if_missing(url)
     if engine is None:
         engine = make_engine(settings)
     Base.metadata.create_all(engine)
-    session_factory = make_session_factory(engine)
-    return engine, session_factory
+    sf = make_session_factory(engine)
+    return engine, sf
 
 
 # ---------------------------------------------------------------------------
-# FastAPI 依赖：Depends(get_db)
+# 全局单例 & FastAPI 同步依赖（get_db 无参数，直接 Depends(get_db)）
 # ---------------------------------------------------------------------------
 
 _global_engine = None
 _global_session_factory: Optional[sessionmaker[Session]] = None
 
 
-def set_global_session_factory(session_factory: sessionmaker[Session], /) -> None:
-    """（给便捷版 API 用）设置全局 session factory。"""
+def set_global_session_factory(sf: sessionmaker[Session], /) -> None:
     global _global_session_factory
-    _global_session_factory = session_factory
+    _global_session_factory = sf
 
 
 def init_database_global(settings: Optional[Settings] = None, engine: Any = None) -> sessionmaker[Session]:
-    """便捷版初始化：构造 engine + session_factory 并存为全局单例。返回 session_factory。"""
     global _global_engine, _global_session_factory
     settings = settings or get_settings()
     _global_engine, sf = init_database(settings, engine)
@@ -269,14 +245,11 @@ def init_database_global(settings: Optional[Settings] = None, engine: Any = None
 
 
 def close_global_engine_session() -> None:
-    """全局资源清理（测试/进程退出时调用）。"""
     global _global_engine, _global_session_factory
-    if _global_session_factory is not None:
-        try:
-            from sqlalchemy.orm import close_all_sessions
-            close_all_sessions()
-        except Exception:
-            pass
+    try:
+        close_all_sessions()
+    except Exception:
+        pass
     if _global_engine is not None:
         try:
             _global_engine.dispose()
@@ -286,65 +259,161 @@ def close_global_engine_session() -> None:
     _global_session_factory = None
 
 
-def get_session_factory(settings: Optional[Settings] = None, /) -> sessionmaker[Session]:
-    """FastAPI Depends：返回全局 session_factory（未初始化则懒初始化一次）。"""
+def get_session_factory() -> sessionmaker[Session]:
+    """给 Depends 内部调用：懒初始化一次全局 session_factory。"""
     if _global_session_factory is None:
-        init_database_global(settings or get_settings())
+        init_database_global(get_settings())
     assert _global_session_factory is not None
     return _global_session_factory
 
 
-def get_db(
-    session_factory: Optional[sessionmaker[Session]] = None,
-    /,
-) -> Generator[Session, None, None]:
-    """FastAPI 标准 session 依赖（yield Session，finally 自动 close）。
-
-    FastAPI 路由层用法：
-        from fastapi import Depends, APIRouter
-        from sqlalchemy.orm import Session
-        from backend.db import get_db, create_pending
-
-        router = APIRouter()
-
-        @router.post("/generations")
-        def create_task(db: Session = Depends(get_db)):
-            rec = create_pending(db, image_path=..., user_input=...)
-            return {"generation_id": rec.task_id}
+def get_db() -> Generator[Session, None, None]:
+    """FastAPI 无参数同步依赖：
+    def create_task(db: Session = Depends(get_db)): ...
     """
-    factory = session_factory or get_session_factory()
+    factory = get_session_factory()
     session = factory()
     try:
         yield session
         session.commit()
     except Exception:
-        session.rollback()
+        try:
+            session.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        session.close()
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 @contextmanager
 def new_session(*, session_factory: Optional[sessionmaker[Session]] = None) -> Generator[Session, None, None]:
-    """非 FastAPI 场景（脚本/CLI/测试）上下文管理器用法，保证 commit/rollback/close。"""
+    """脚本/测试用同步上下文管理器。"""
     factory = session_factory or get_session_factory()
     s = factory()
     try:
         yield s
         s.commit()
     except Exception:
-        s.rollback()
+        try:
+            s.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        s.close()
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
-# Repository API（显式 Session 参数，推荐）
+# 异步 asyncio 版本（给 B 的 async 路由用，线程隔离或直接 async_session）
+# ---------------------------------------------------------------------------
+
+_async_engine: Any = None
+_async_session_factory: Any = None
+
+
+def _async_sync_url_to_async(url: str) -> str:
+    """把 mysql+pymysql://... -> mysql+aiomysql://...（异步 driver 替换。"""
+    if url.startswith("mysql+pymysql"):
+        return url.replace("mysql+pymysql", "mysql+aiomysql", 1)
+    if url.startswith("postgresql+psycopg2"):
+        return url.replace("postgresql+psycopg2", "postgresql+asyncpg", 1)
+    if url.startswith("sqlite"):
+        # 不强制：同步和异步都能用
+        return url
+    return url
+
+
+def make_async_engine(settings: Settings, /) -> Any:
+    if create_async_engine is None:  # pragma: no cover
+        raise RuntimeError("SQLAlchemy async 不可用，请 pip install sqlalchemy[asyncio] + aiomysql/asyncpg")
+    url = _async_sync_url_to_async(build_database_url(settings))
+    if url.startswith("sqlite"):
+        return create_async_engine(url, future=True)
+    return create_async_engine(
+        url,
+        future=True,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        echo=False,
+    )
+
+
+def init_database_async(settings: Optional[Settings] = None) -> Tuple[Any, Any]:
+    settings = settings or get_settings()
+    # 先同步建库建表（metadata.create_all 同步即可，无需 async）
+    sync_engine, _ = init_database(settings)
+    try:
+        sync_engine.dispose()
+    except Exception:
+        pass
+    aengine = make_async_engine(settings)
+    asf = async_sessionmaker(
+        bind=aengine,
+        autoflush=False,
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    global _async_engine, _async_session_factory
+    _async_engine = aengine
+    _async_session_factory = asf
+    return aengine, asf
+
+
+def _get_async_session_factory() -> Any:
+    if _async_session_factory is None:
+        init_database_async(get_settings())
+    return _async_session_factory
+
+
+@asynccontextmanager
+async def async_get_db() -> AsyncGenerator[Any, None, None]:
+    """FastAPI 无参数异步依赖：
+    async def create_task(db: AsyncSession = Depends(async_get_db)): ...
+    """
+    factory = _get_async_session_factory()
+    session = factory()
+    try:
+        yield session
+        await session.commit()
+    except Exception:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            await session.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 同步 Repository API（第一个参数显式 Session；异常时先 rollback）
 # ---------------------------------------------------------------------------
 
 def _generate_task_id() -> str:
-    return "gen_" + uuid.uuid4().hex[:24]
+    """B 的标准 UUID：只生成一次 uuid.uuid4()，写入 DB 前不再重新生成。"""
+    return str(uuid.uuid4())
+
+
+def _resolve_image_description(image_description: Any = None, image_summary: Any = None) -> Optional[str]:
+    if image_summary is not None:
+        return None if image_summary is None else str(image_summary)
+    return None if image_description is None else str(image_description)
+
+
+def _resolve_content(content: Any = None, body: Any = None) -> Optional[str]:
+    if body is not None:
+        return None if body is None else str(body)
+    return None if content is None else str(content)
 
 
 def create_pending(
@@ -354,15 +423,20 @@ def create_pending(
     image_path: Optional[str] = None,
     user_input: Optional[str] = None,
     image_description: Optional[str] = None,
+    image_summary: Optional[str] = None,
 ) -> GenerationRecord:
-    """[供 B 调用] 创建 pending 任务并落库，返回 ORM 对象。"""
-    task_id = _generate_task_id()
+    """[B 调用] 创建 pending 任务。接受 image_summary（A 对齐字段）或 image_description。
+
+    task_id 只生成一次 uuid.uuid4()（标准 UUID），写库失败时不再重复生成（抛异常给上层）。
+    """
+    task_id = _generate_task_id()  # 只生成一次
+    img_desc = _resolve_image_description(image_description=image_description, image_summary=image_summary)
     record = GenerationRecord(
         task_id=task_id,
         status=TASK_STATUS_PENDING,
         image_path=image_path,
         user_input=user_input,
-        image_description=image_description,
+        image_description=img_desc,
     )
     try:
         db.add(record)
@@ -371,19 +445,25 @@ def create_pending(
         db.refresh(record)
         return record
     except BusinessException:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         raise
     except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         raise BusinessException(ErrorCode.DATABASE_ERROR, f"create_pending failed: {e}")
 
 
 def _get_by_task_id_or_raise(db: Session, task_id: str) -> GenerationRecord:
     from sqlalchemy import select as _sa_select
 
-    row = db.execute(
-        _sa_select(GenerationRecord).where(GenerationRecord.task_id == task_id)
-    ).scalar_one_or_none()
+    row = db.execute(_sa_select(GenerationRecord).where(GenerationRecord.task_id == task_id)).scalar_one_or_none()
     if row is None:
-        raise BusinessException(ErrorCode.TASK_NOT_FOUND, f"generation_id={task_id} not found")
+        raise BusinessException(ErrorCode.TASK_NOT_FOUND, f"task_id={task_id} 不存在")
     return row
 
 
@@ -393,21 +473,32 @@ def mark_success(
     *,
     task_id: str,
     title: str,
-    content: str,
+    content: Optional[str] = None,
     tags: Iterable[str],
     image_description: Optional[str] = None,
+    image_summary: Optional[str] = None,
+    body: Optional[str] = None,
 ) -> GenerationRecord:
-    """[供 B 调用] 标记 success 并落库。
-
-    内部强制跑 validate_copy()：不合规直接抛 BusinessException(VALIDATION_ERROR)，
-    不写脏数据。所有写库字段都会用 validate_copy 规范化后的值。
-    """
+    """[B 调用] 标记 success。支持 image_summary / body 别名。内部强制 validate_copy，不合规 rollback。"""
     record = _get_by_task_id_or_raise(db, task_id)
-    desc_to_validate = image_description if image_description is not None else (record.image_description or "")
-    norm_tags_list = list(tags) if not isinstance(tags, list) else tags
-    norm_desc, norm_title, norm_content, norm_tags = validate_copy(
-        desc_to_validate, title, content, norm_tags_list
-    )
+    # 校验时：显式传参优先于 DB 已有，否则 DB 已有
+    desc_arg = _resolve_image_description(image_description=image_description, image_summary=image_summary)
+    desc_to_validate = desc_arg if desc_arg is not None else (record.image_description or "")
+    content_arg = _resolve_content(content=content, body=body)
+    content_to_validate = content_arg if content_arg is not None else (record.content or "")
+    try:
+        norm_desc, norm_title, norm_content, norm_tags = validate_copy(
+            image_description=desc_to_validate,
+            title=title,
+            content=content_to_validate,
+            tags=list(tags),
+        )
+    except BusinessException:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
 
     record.status = TASK_STATUS_SUCCESS
     record.title = norm_title
@@ -424,8 +515,16 @@ def mark_success(
         db.refresh(record)
         return record
     except BusinessException:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         raise
     except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         raise BusinessException(ErrorCode.DATABASE_ERROR, f"mark_success failed: {e}")
 
 
@@ -437,14 +536,16 @@ def mark_failed(
     error_code: str,
     error_message: str,
     image_description: Optional[str] = None,
+    image_summary: Optional[str] = None,
 ) -> GenerationRecord:
-    """[供 B 调用] 标记 failed 并落库，写入 error_code + error_message。"""
+    """[B 调用] 标记 failed。接受 image_summary 别名。异常时先 rollback。"""
     record = _get_by_task_id_or_raise(db, task_id)
     record.status = TASK_STATUS_FAILED
     record.error_code = error_code
     record.error_message = error_message
-    if image_description is not None:
-        record.image_description = image_description
+    img_desc = _resolve_image_description(image_description=image_description, image_summary=image_summary)
+    if img_desc is not None:
+        record.image_description = img_desc
     record.updated_at = datetime.utcnow()
 
     try:
@@ -453,25 +554,27 @@ def mark_failed(
         db.refresh(record)
         return record
     except BusinessException:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         raise
     except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         raise BusinessException(ErrorCode.DATABASE_ERROR, f"mark_failed failed: {e}")
 
 
 def get_record(db: Session, /, *, task_id: str) -> Optional[GenerationRecord]:
     from sqlalchemy import select as _sa_select
 
-    return db.execute(
-        _sa_select(GenerationRecord).where(GenerationRecord.task_id == task_id)
-    ).scalar_one_or_none()
+    return db.execute(_sa_select(GenerationRecord).where(GenerationRecord.task_id == task_id)).scalar_one_or_none()
 
 
 def list_records(
-    db: Session,
-    /,
-    *,
-    status: Optional[str] = None,
-    limit: int = 100,
+    db: Session, /, *, status: Optional[str] = None, limit: int = 100
 ) -> List[GenerationRecord]:
     from sqlalchemy import select as _sa_select
 
@@ -483,20 +586,171 @@ def list_records(
 
 
 # ---------------------------------------------------------------------------
-# 便捷版 Repository API（隐式使用全局 session_factory）
+# 异步 Repository API（第一个参数显式 AsyncSession；await 调用）
 # ---------------------------------------------------------------------------
 
-def _g_session() -> Session:
-    if _global_session_factory is None:
-        init_database_global(get_settings())
-    assert _global_session_factory is not None
-    return _global_session_factory()
-
-
-def _wrap_with_session(func, *args, **kwargs):
-    s = _g_session()
+async def acreate_pending(
+    db: Any,
+    /,
+    *,
+    image_path: Optional[str] = None,
+    user_input: Optional[str] = None,
+    image_description: Optional[str] = None,
+    image_summary: Optional[str] = None,
+) -> GenerationRecord:
+    task_id = _generate_task_id()
+    img_desc = _resolve_image_description(image_description=image_description, image_summary=image_summary)
+    record = GenerationRecord(
+        task_id=task_id,
+        status=TASK_STATUS_PENDING,
+        image_path=image_path,
+        user_input=user_input,
+        image_description=img_desc,
+    )
     try:
-        return func(s, *args, **kwargs)
+        db.add(record)
+        await db.flush()
+        await db.commit()
+        await db.refresh(record)
+        return record
+    except BusinessException:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise BusinessException(ErrorCode.DATABASE_ERROR, f"acreate_pending failed: {e}")
+
+
+async def _a_get_by_task_id_or_raise(db: Any, task_id: str) -> GenerationRecord:
+    from sqlalchemy import select as _sa_select
+
+    row = (await db.execute(_sa_select(GenerationRecord).where(GenerationRecord.task_id == task_id))).scalar_one_or_none()
+    if row is None:
+        raise BusinessException(ErrorCode.TASK_NOT_FOUND, f"task_id={task_id} 不存在")
+    return row
+
+
+async def amark_success(
+    db: Any,
+    /,
+    *,
+    task_id: str,
+    title: str,
+    content: Optional[str] = None,
+    tags: Iterable[str],
+    image_description: Optional[str] = None,
+    image_summary: Optional[str] = None,
+    body: Optional[str] = None,
+) -> GenerationRecord:
+    record = await _a_get_by_task_id_or_raise(db, task_id)
+    desc_arg = _resolve_image_description(image_description=image_description, image_summary=image_summary)
+    desc_to_validate = desc_arg if desc_arg is not None else (record.image_description or "")
+    content_arg = _resolve_content(content=content, body=body)
+    content_to_validate = content_arg if content_arg is not None else (record.content or "")
+    try:
+        norm_desc, norm_title, norm_content, norm_tags = validate_copy(
+            image_description=desc_to_validate,
+            title=title,
+            content=content_to_validate,
+            tags=list(tags),
+        )
+    except BusinessException:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise
+
+    record.status = TASK_STATUS_SUCCESS
+    record.title = norm_title
+    record.content = norm_content
+    record.tags = list(norm_tags)
+    record.image_description = norm_desc
+    record.updated_at = datetime.utcnow()
+    record.error_code = None
+    record.error_message = None
+
+    try:
+        await db.flush()
+        await db.commit()
+        await db.refresh(record)
+        return record
+    except BusinessException:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise BusinessException(ErrorCode.DATABASE_ERROR, f"amark_success failed: {e}")
+
+
+async def amark_failed(
+    db: Any,
+    /,
+    *,
+    task_id: str,
+    error_code: str,
+    error_message: str,
+    image_description: Optional[str] = None,
+    image_summary: Optional[str] = None,
+) -> GenerationRecord:
+    record = await _a_get_by_task_id_or_raise(db, task_id)
+    record.status = TASK_STATUS_FAILED
+    record.error_code = error_code
+    record.error_message = error_message
+    img_desc = _resolve_image_description(image_description=image_description, image_summary=image_summary)
+    if img_desc is not None:
+        record.image_description = img_desc
+    record.updated_at = datetime.utcnow()
+
+    try:
+        await db.flush()
+        await db.commit()
+        await db.refresh(record)
+        return record
+    except BusinessException:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise BusinessException(ErrorCode.DATABASE_ERROR, f"amark_failed failed: {e}")
+
+
+async def aget_record(db: Any, /, *, task_id: str) -> Optional[GenerationRecord]:
+    from sqlalchemy import select as _sa_select
+
+    return (await db.execute(_sa_select(GenerationRecord).where(GenerationRecord.task_id == task_id))).scalar_one_or_none()
+
+
+# ---------------------------------------------------------------------------
+# 便捷版（无 Session 参数，内部开新 session）
+# ---------------------------------------------------------------------------
+
+def _g_sync_session() -> Session:
+    return get_session_factory()()
+
+
+def _wrap_sync(func, **kwargs):
+    s = _g_sync_session()
+    try:
+        return func(s, **kwargs)
     finally:
         try:
             s.close()
@@ -505,48 +759,37 @@ def _wrap_with_session(func, *args, **kwargs):
 
 
 def create_pending_g(**kwargs) -> GenerationRecord:
-    return _wrap_with_session(create_pending, **kwargs)
-
+    return _wrap_sync(create_pending, **kwargs)
 
 def mark_success_g(**kwargs) -> GenerationRecord:
-    return _wrap_with_session(mark_success, **kwargs)
-
+    return _wrap_sync(mark_success, **kwargs)
 
 def mark_failed_g(**kwargs) -> GenerationRecord:
-    return _wrap_with_session(mark_failed, **kwargs)
-
+    return _wrap_sync(mark_failed, **kwargs)
 
 def get_record_g(**kwargs) -> Optional[GenerationRecord]:
-    return _wrap_with_session(get_record, **kwargs)
-
+    return _wrap_sync(get_record, **kwargs)
 
 def list_records_g(**kwargs) -> List[GenerationRecord]:
-    return _wrap_with_session(list_records, **kwargs)
+    return _wrap_sync(list_records, **kwargs)
 
 
 __all__ = [
-    "Base",
-    "GenerationRecord",
-    "TASK_STATUS_PENDING",
-    "TASK_STATUS_SUCCESS",
-    "TASK_STATUS_FAILED",
-    "make_engine",
-    "make_session_factory",
-    "init_database",
-    "init_database_global",
-    "set_global_session_factory",
-    "close_global_engine_session",
+    # ORM
+    "Base", "GenerationRecord",
+    "TASK_STATUS_PENDING", "TASK_STATUS_SUCCESS", "TASK_STATUS_FAILED",
+    # Sync engine/session
+    "make_engine", "make_session_factory",
+    "init_database", "init_database_global",
+    "set_global_session_factory", "close_global_engine_session",
     "get_session_factory",
-    "get_db",
-    "new_session",
-    "create_pending",
-    "mark_success",
-    "mark_failed",
-    "get_record",
-    "list_records",
-    "create_pending_g",
-    "mark_success_g",
-    "mark_failed_g",
-    "get_record_g",
-    "list_records_g",
+    "get_db", "new_session",
+    # Async engine/session
+    "init_database_async", "async_get_db", "make_async_engine",
+    # Sync Repository
+    "create_pending", "mark_success", "mark_failed", "get_record", "list_records",
+    # Async Repository
+    "acreate_pending", "amark_success", "amark_failed", "aget_record",
+    # Convenience
+    "create_pending_g", "mark_success_g", "mark_failed_g", "get_record_g", "list_records_g",
 ]

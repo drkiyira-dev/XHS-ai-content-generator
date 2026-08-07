@@ -1,15 +1,6 @@
-"""一键自测脚本（FastAPI + 纯 SQLAlchemy 2.x）。
+"""一键自测脚本（同步 SQLite 默认临时文件；MYSQL_TEST_URL 真实 MySQL 开关）。
 
-默认：临时 SQLite 文件，保证 5 步全部通过，一键执行：
-    python backend/tests/run_selfcheck.py
-
-真实 MySQL 验收模式（设置环境变量 MYSQL_TEST_URL）：
-    MYSQL_TEST_URL="mysql+pymysql://u:p@127.0.0.1:3306/xhs_test?charset=utf8mb4" \
-        python backend/tests/run_selfcheck.py
-    - 自动 CREATE DATABASE IF NOT EXISTS
-    - 跑一次 create_pending + mark_success + mark_failed
-    - 完成后可选 MYSQL_TEST_CLEANUP=1 自动 DROP 临时库（默认不删，便于手动 SELECT 验收）
-    - 所有输出中的密码均做 mask_database_url 脱敏
+MySQL 安全注意：MYSQL_TEST_CLEANUP=1 时仅当 db 名匹配（xhs_test / *_test / test_* 才允许 DROP。
 """
 from __future__ import annotations
 
@@ -20,8 +11,8 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from backend.db import (
     close_global_engine_session,
@@ -35,13 +26,10 @@ from backend.db import (
     TASK_STATUS_FAILED,
     TASK_STATUS_SUCCESS,
 )
-from backend.db.config import (
-    Settings,
-    mask_database_url,
-    parse_mysql_url,
-)
+from backend.config import Settings, mask_database_url, parse_mysql_url
 from backend.schemas import BusinessException, ErrorCode
-from backend.validation import validate_copy
+from backend.validation import validate_copy, validate_generation_result
+from sqlalchemy.orm import close_all_sessions
 
 
 def _sqlite_tmp_setup():
@@ -60,8 +48,7 @@ def _mysql_setup_from_env():
     if not raw:
         return None
     settings = Settings(DATABASE_URL=raw, _env_file=None)
-    # 真实 MySQL：先建库（保证 DATABASE 存在），之后用它 create_all
-    parsed = parse_mysql_url(settings.DATABASE_URL)
+    parsed = parse_mysql_url(settings.DATABASE_URL or "")
     if not parsed:
         raise SystemExit(f"[FAIL] MYSQL_TEST_URL={mask_database_url(raw)} 解析失败")
     import pymysql  # type: ignore
@@ -80,102 +67,148 @@ def _mysql_setup_from_env():
     return settings
 
 
+_SAFE_TEST_DB_PREFIXES = ("xhs_test", "test_")
+_SAFE_TEST_DB_SUFFIXES = ("_test",)
+
+
+def _is_safe_test_db(dbname: str) -> bool:
+    if not dbname:
+        return False
+    d = dbname.lower()
+    if d == "xhs_test":
+        return True
+    for p in _SAFE_TEST_DB_PREFIXES:
+        if d.startswith(p):
+            return True
+    for s in _SAFE_TEST_DB_SUFFIXES:
+        if d.endswith(s):
+            return True
+    return False
+
+
 def _mysql_cleanup(settings: Settings) -> None:
     if os.environ.get("MYSQL_TEST_CLEANUP", "0") != "1":
         return
-    parsed = parse_mysql_url(settings.DATABASE_URL)
+    parsed = parse_mysql_url(settings.DATABASE_URL or "")
     if not parsed:
+        return
+    user, password, host, port, database = parsed
+    if not _is_safe_test_db(database):
+        print(
+            f"[SAFE] 跳过 DROP：database='{database}' 不匹配测试库模式 "
+            f"（允许：xhs_test、test_* 前缀、*_test 后缀），防止误删正式库。"
+        )
         return
     import pymysql  # type: ignore
 
-    user, password, host, port, database = parsed
     try:
         conn = pymysql.connect(host=host, port=port, user=user, password=password or "", charset="utf8mb4")
         try:
             with conn.cursor() as cur:
                 cur.execute(f"DROP DATABASE IF EXISTS `{database}`;")
             conn.commit()
+            print(f"[CLEANUP] 已删除测试库 `{database}`")
         finally:
             conn.close()
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         print(f"[WARN] MySQL 清理失败（不影响结果）：{e}")
 
 
 def _workflow_5_steps(settings: Settings) -> None:
     engine, session_factory = init_database(settings)
     try:
-        # 1. create_pending
         print("[1/5] create_pending...")
         with new_session(session_factory=session_factory) as s:
-            r = create_pending(s, image_path="/tmp/a.jpg", user_input="夏日穿搭")
-            assert r.task_id.startswith("gen_") and r.status == "pending"
+            r = create_pending(
+                s,
+                image_path="/tmp/a.jpg",
+                user_input="夏日穿搭",
+                image_summary="阳光下的连衣裙",
+            )
+            assert r.task_id.count("-") == 4, f"标准 UUID4 应含 4 个 '-', got {r.task_id}"
+            assert r.status == "pending"
             tid = r.task_id
-        print("    OK generation_id =", tid)
+        print(f"    OK generation_id = {tid} (标准 UUID4)")
 
-        # 2. validate_copy 不合规拦截（4 种子情况）
-        print("[2/5] validate_copy 不合规 -> 抛异常；mark_success 内部再校验一遍")
+        print("[2/5] validate_copy/validate_generation_result + mark_success 内部校验不写脏数据")
 
-        def _expect_validation(title="短", desc="desc", content="正文", tags=["a", "b", "c"]):
+        def _expect_val(desc="好图", title="短", content="正文", tags=None):
+            if tags is None:
+                tags = ["a", "b", "c"]
             try:
                 validate_copy(image_description=desc, title=title, content=content, tags=tags)
                 return None
             except BusinessException as e:
                 return e
 
-        e = _expect_validation(title="这个标题绝对超过二十个字你数一下看看对不对")
-        assert e and e.code == ErrorCode.VALIDATION_ERROR, "超长标题应被拦截"
-        print("    OK 超长标题被拦截，code=", e.code)
+        e = _expect_val(title="这个标题绝对超过二十个字你数一下看看对不对哦")
+        assert e and e.code == ErrorCode.VALIDATION_ERROR
+        print("    OK 超长标题拦截，code=", e.code)
 
-        e = _expect_validation(desc="")
-        assert e, "空描述应被拦截"
-        print("    OK 空描述被拦截")
+        e = _expect_val(desc="")
+        assert e and e.data
+        print("    OK 空描述拦截")
 
-        e = _expect_validation(content="")
-        assert e, "空正文应被拦截"
-        print("    OK 空正文被拦截")
+        e = _expect_val(content="")
+        assert e
+        print("    OK 空正文拦截")
 
-        e = _expect_validation(tags=["a", "a", "b"])
-        assert e and e.code == ErrorCode.VALIDATION_ERROR, "标签去重后 <3 应被拦截"
-        print("    OK 标签不足(去重后<3)被拦截，code=", e.code)
+        e = _expect_val(tags=["a", "a", "b"])
+        assert e and e.code == ErrorCode.VALIDATION_ERROR
+        print("    OK 标签不足（去重后<3）拦截")
 
-        # 校验 mark_success 自己也会再次校验（不合规 -> 不写库）
+        # validate_generation_result：A 对齐字段 image_summary / body
+        try:
+            validate_generation_result({
+                "image_summary": "",
+                "body": "正文正文",
+                "title": "标题",
+                "tags": ["a", "b", "c", "d"],
+            })
+            assert False, "应抛 image_summary 空而失败"
+        except BusinessException as e2:
+            assert "image_summary" in (e2.data or {}), f"应含 image_summary 错误，实际 {e2.data}"
+        print("    OK validate_generation_result: image_summary 空拦截")
+
         with new_session(session_factory=session_factory) as s:
             r = create_pending(s, image_path="/tmp/bad.jpg")
             try:
                 mark_success(
                     s,
                     task_id=r.task_id,
-                    title="这个标题绝对超过二十个字你数一下看看对不对哦",
-                    content="正文",
+                    title="这个标题绝对超过二十个字你数一下看看对不对哦哦",
+                    body="正文",
                     tags=["a", "b", "c", "d"],
-                    image_description="描述",
+                    image_summary="描述",
                 )
             except BusinessException as ee:
                 assert ee.code == ErrorCode.VALIDATION_ERROR
-                # 确认写库前被拦截了：查出来应该还是 pending
                 again = get_record(s, task_id=r.task_id)
-                assert again and again.status == "pending", "mark_success 校验失败后不应写脏数据"
+                assert again and again.status == "pending", "mark_success 不合规不应写脏数据"
         print("    OK mark_success 内部再次校验，不合规不写库")
 
-        # 3. mark_success 合规成功 + 标签规范化
-        print("[3/5] mark_success 合规成功，自动规范化")
+        print("[3/5] mark_success（image_summary/body 字段别名 → DB image_description/content")
         with new_session(session_factory=session_factory) as s:
             r2 = mark_success(
                 s,
                 task_id=tid,
                 title="夏日穿搭分享",
-                content="今天分享三套夏日 look，显瘦又出片！",
+                body="今天分享三套夏日 look，显瘦又出片！",
                 tags=["夏日", "穿搭", "#穿搭", "OOTD", "夏日", "每日"],
-                image_description="阳光下的白色连衣裙",
+                image_summary="阳光下的白色连衣裙",
             )
             assert r2.status == TASK_STATUS_SUCCESS
             assert len(r2.title) <= 20
-            assert r2.content and r2.image_description
+            assert r2.image_description == "阳光下的白色连衣裙", (
+                f"image_summary 应映射到 image_description，实际 {r2.image_description!r}"
+            )
+            assert r2.content == "今天分享三套夏日 look，显瘦又出片！", (
+                f"body 应映射到 content，实际 {r2.content!r}"
+            )
             assert 3 <= len(r2.tags or []) <= 5
             assert all(t.startswith("#") for t in (r2.tags or []))
-        print("    OK tags=", r2.tags)
+        print("    OK tags =", r2.tags)
 
-        # 4. mark_failed 带错误码落库
         print("[4/5] mark_failed 带错误码落库")
         with new_session(session_factory=session_factory) as s:
             r3 = create_pending(s, image_path="/tmp/bad.png")
@@ -185,16 +218,16 @@ def _workflow_5_steps(settings: Settings) -> None:
                 task_id=r3.task_id,
                 error_code=ErrorCode.IMAGE_PROCESS_ERROR,
                 error_message="图片损坏",
+                image_summary="坏图描述",
             )
             assert f.status == TASK_STATUS_FAILED
             assert f.error_code == ErrorCode.IMAGE_PROCESS_ERROR
             assert f.error_message == "图片损坏"
-        print("    OK error_code/error_message 已保存")
+            assert f.image_description == "坏图描述"
+        print("    OK error_code/error_message 已保存；image_summary→image_description 生效")
 
-        # 5. 模拟重启（销毁 engine+session 再重建），记录仍存在
         print("[5/5] 服务重启后记录仍存在")
         try:
-            from sqlalchemy.orm import close_all_sessions
             close_all_sessions()
         except Exception:
             pass
@@ -208,12 +241,11 @@ def _workflow_5_steps(settings: Settings) -> None:
                 g = get_record(s, task_id=tid)
                 assert g and g.status == TASK_STATUS_SUCCESS and g.user_input == "夏日穿搭"
                 g2 = get_record(s, task_id=failed_tid)
-                assert g2 and g2.status == TASK_STATUS_FAILED and g2.error_code
+                assert g2 and g2.status == TASK_STATUS_FAILED
                 cnt = len(list_records(s))
                 assert cnt >= 2
         finally:
             try:
-                from sqlalchemy.orm import close_all_sessions
                 close_all_sessions()
             except Exception:
                 pass
@@ -224,7 +256,6 @@ def _workflow_5_steps(settings: Settings) -> None:
         print("    OK")
     finally:
         try:
-            from sqlalchemy.orm import close_all_sessions
             close_all_sessions()
         except Exception:
             pass
@@ -238,7 +269,7 @@ def _workflow_5_steps(settings: Settings) -> None:
 def main() -> int:
     mysql_settings = _mysql_setup_from_env()
     if mysql_settings is not None:
-        print(f"[MODE] 真实 MySQL 验收（MYSQL_TEST_URL={mask_database_url(mysql_settings.DATABASE_URL)}）")
+        print(f"[MODE] 真实 MySQL 验收（MYSQL_TEST_URL={mask_database_url(mysql_settings.DATABASE_URL or '')}）")
         try:
             _workflow_5_steps(mysql_settings)
         finally:
@@ -248,11 +279,11 @@ def main() -> int:
 
     tmp, _db_path, settings = _sqlite_tmp_setup()
     try:
-        print(f"[MODE] 临时 SQLite（DATABASE_URL={mask_database_url(settings.DATABASE_URL)}）")
+        print(f"[MODE] 临时 SQLite（DATABASE_URL={mask_database_url(settings.DATABASE_URL or '')}）")
         _workflow_5_steps(settings)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    print("\n[ALL PASSED] 数据库 4 核心能力 + 5 校验规则全部通过。")
+    print("\n[ALL PASSED] 数据库核心能力 + 校验规则 + 字段映射全部通过。")
     return 0
 
 

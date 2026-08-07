@@ -1,22 +1,19 @@
-"""Validation package: 文案合规校验。
+"""Validation package：文案合规校验（B/C 共用，零 Flask 依赖。
+
+支持字段映射（B 已与 A 对齐的接口字段：
+    image_summary  -> 内部 image_description
+    body           -> 内部 content
 
 核心导出：
-    validate_copy(image_description, title, content, tags)
-        -> (norm_desc, norm_title, norm_content, norm_tags)
-        不合规则抛 BusinessException(VALIDATION_ERROR)，不会把脏数据交给前端/写库。
-
-    validate_generation_result(dict) -> dict
-        对 LLM 返回整包对象做校验并返回规范化 dict。
-
-规则：
-    - image_description 非空
-    - title 非空 且 ≤20 字
-    - content 非空
-    - tags 去重并补 # 前缀后数量在 3~5 个
+    validate_copy(image_description=..., title=..., content=..., tags=...)
+    validate_generation_result(dict)
+        dict 支持 {image_summary, body 或 image_description, content
 """
-from typing import List, Dict, Any, Tuple
+from __future__ import annotations
 
-from ..schemas import ErrorCode, BusinessException
+from typing import Any, Dict, List, Tuple
+
+from ..schemas import BusinessException, ErrorCode
 
 
 MAX_TITLE_LENGTH = 20
@@ -24,14 +21,14 @@ MIN_TAGS_COUNT = 3
 MAX_TAGS_COUNT = 5
 
 
-def _normalize_tag(tag: str) -> str:
+def _normalize_tag(tag: Any) -> str:
     if tag is None:
         return ""
     return str(tag).strip().strip("#").strip()
 
 
-def normalize_tags(tags: List[str]) -> List[str]:
-    """去重并在每个标签前补 #，保持原顺序。空标签自动丢弃。"""
+def normalize_tags(tags: List[Any]) -> List[str]:
+    """去重 + 补 #，保持原顺序。空丢弃。"""
     if not tags:
         return []
     seen = set()
@@ -45,28 +42,51 @@ def normalize_tags(tags: List[str]) -> List[str]:
     return result
 
 
+def _coerce_image_description(
+    image_description: Any = None,
+    image_summary: Any = None,
+) -> str:
+    """image_summary 是 image_description 的别名（B 与 A 对齐的字段。两者都给时优先 image_summary。"""
+    v = image_summary if image_summary is not None else image_description
+    return ("" if v is None else str(v)).strip()
+
+
+def _coerce_content(content: Any = None, body: Any = None) -> str:
+    """body 是 content 的别名（B 与 A 对齐的字段）。两者都给时优先 body。"""
+    v = body if body is not None else content
+    return ("" if v is None else str(v)).strip()
+
+
 def validate_copy(
-    image_description: str,
-    title: str,
-    content: str,
-    tags: List[str],
+    image_description: str = "",
+    title: str = "",
+    content: str = "",
+    tags: List[Any] | None = None,
+    *,
+    image_summary: Any = None,
+    body: Any = None,
 ) -> Tuple[str, str, str, List[str]]:
-    """校验并规范化四件套。不合规则抛出 VALIDATION_ERROR。"""
+    """校验 & 规范化。不合规则抛 VALIDATION_ERROR。
+
+    参数别名：image_summary -> image_description；body -> content。
+    """
     errors: Dict[str, str] = {}
 
-    image_description = (image_description or "").strip()
-    if not image_description:
+    desc = _coerce_image_description(image_description=image_description, image_summary=image_summary)
+    if not desc:
         errors["image_description"] = "图片描述不能为空"
+        errors["image_summary"] = "图片描述不能为空"
 
-    title = (title or "").strip()
-    if not title:
+    title_s = ("" if title is None else str(title)).strip()
+    if not title_s:
         errors["title"] = "标题不能为空"
-    elif len(title) > MAX_TITLE_LENGTH:
-        errors["title"] = f"标题超过 {MAX_TITLE_LENGTH} 字限制（当前 {len(title)} 字）"
+    elif len(title_s) > MAX_TITLE_LENGTH:
+        errors["title"] = f"标题超过 {MAX_TITLE_LENGTH} 字限制（当前 {len(title_s)} 字）"
 
-    content = (content or "").strip()
-    if not content:
+    content_s = _coerce_content(content=content, body=body)
+    if not content_s:
         errors["content"] = "正文不能为空"
+        errors["body"] = "正文不能为空"
 
     norm_tags = normalize_tags(tags or [])
     n = len(norm_tags)
@@ -74,25 +94,37 @@ def validate_copy(
         errors["tags"] = f"标签数量需在 {MIN_TAGS_COUNT}~{MAX_TAGS_COUNT} 个之间（当前 {n} 个，已去重补#）"
 
     if errors:
-        raise BusinessException(ErrorCode.VALIDATION_ERROR, "文案规则校验失败", errors)
+        raise BusinessException(
+            ErrorCode.VALIDATION_ERROR,
+            "文案规则校验失败",
+            errors,
+        )
 
-    return image_description, title, content, norm_tags
+    return desc, title_s, content_s, norm_tags
 
 
 def validate_generation_result(result: Dict[str, Any]) -> Dict[str, Any]:
-    """校验 LLM 返回的整包 dict，返回规范化后的字段集合。"""
+    """对 LLM 整包做校验并规范化 dict。支持 A/B 字段名都支持：
+        - image_summary 或 image_description
+        - body 或 content
+        - title / tags
+    返回规范化字段：{image_description, title, content, tags}
+    """
     if not isinstance(result, dict):
         raise BusinessException(ErrorCode.VALIDATION_ERROR, "生成结果格式错误（预期对象）")
-
-    desc, title, content, tags = validate_copy(
-        result.get("image_description") or "",
-        result.get("title") or "",
-        result.get("content") or "",
-        result.get("tags") or [],
+    desc, title_s, content_s, tags = validate_copy(
+        image_description=result.get("image_description") or "",
+        image_summary=result.get("image_summary") or "",
+        title=result.get("title") or "",
+        content=result.get("content") or "",
+        body=result.get("body") or "",
+        tags=result.get("tags") or [],
     )
     return {
         "image_description": desc,
-        "title": title,
-        "content": content,
+        "image_summary": desc,
+        "title": title_s,
+        "content": content_s,
+        "body": content_s,
         "tags": tags,
     }
