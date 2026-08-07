@@ -1,4 +1,4 @@
-# ---------- 环境变量 & 密钥（必须保留：C 侧成员约定）----------
+# ---------- 环境变量 & 密钥（C 侧强约束：必须保留在首 3 行）----------
 .env
 .env.*
 !.env.example
@@ -34,7 +34,7 @@ data/mysql/
 *.sock
 *.pid
 
-# ---------- SQL dump / 业务数据备份（schema 可以提交，但 backup/dump 不行）----------
+# ---------- SQL dump / 业务数据备份（schema 可提交；dump/backup 禁止）----------
 *.sql.gz
 *.sql.bz2
 *.sql.zip
@@ -48,9 +48,15 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# ---------- 前端（必须保留：前端 node_modules / dist）----------
+# ---------- 前端（develop 版 + C 版合并：node_modules/dist + frontend/.env）----------
 frontend/node_modules/
 frontend/dist/
+frontend/.env
+
+# ---------- 后端（来自 develop：backend/__pycache__ / backend/.env / backend/uploads/）----------
+backend/__pycache__/
+backend/.env
+backend/uploads/
 
 # ---------- 系统 / IDE ----------
 .DS_Store

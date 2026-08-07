@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.config import Settings, ensure_uploads_dir, get_settings, mask_database_url
+from backend.core.config import Settings, ensure_uploads_dir, get_settings, mask_database_url
 from backend.db import init_database, close_global_engine_session
 from sqlalchemy.orm import close_all_sessions
 

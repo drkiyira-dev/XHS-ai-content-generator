@@ -1,10 +1,18 @@
 """一键自测脚本（同步 SQLite 默认临时文件；MYSQL_TEST_URL 真实 MySQL 开关）。
 
-MySQL 安全注意：MYSQL_TEST_CLEANUP=1 时仅当 db 名匹配（xhs_test / *_test / test_* 才允许 DROP。
+MYSQL_TEST_CLEANUP 安全策略（严格白名单）：
+- 库名必须匹配：字母开头 + [字母数字下划线_]{0,63}；
+- 且满足：
+    1) xhs_test（精确）
+    2) 前缀 xhs_test_* 或 test_*
+    3) 后缀 *_test（必须整个是 xxx_test，且 xxx 段不含 test 本身以避免 test_prod / production_test 误匹配）
+- 任何情况下：库名包含 prod / production / online / master / live / release 等关键词一律拒绝，
+  同时严格禁止字符集外的符号（反引号 / -- / ; / unicode 等）。
 """
 from __future__ import annotations
 
 import os
+import re as _re
 import shutil
 import sys
 import tempfile
@@ -26,7 +34,7 @@ from backend.db import (
     TASK_STATUS_FAILED,
     TASK_STATUS_SUCCESS,
 )
-from backend.config import Settings, mask_database_url, parse_mysql_url
+from backend.core.config import Settings, mask_database_url, parse_mysql_url
 from backend.schemas import BusinessException, ErrorCode
 from backend.validation import validate_copy, validate_generation_result
 from sqlalchemy.orm import close_all_sessions
@@ -67,21 +75,46 @@ def _mysql_setup_from_env():
     return settings
 
 
-_SAFE_TEST_DB_PREFIXES = ("xhs_test", "test_")
-_SAFE_TEST_DB_SUFFIXES = ("_test",)
+_SAFE_TEST_DB_PREFIXES = ("xhs_test_", "test_")
+_SAFE_TEST_DB_SUFFIX = "_test"
+_SAFE_TEST_DB_EXACT = {"xhs_test"}
+_FORBIDDEN_DB_TOKENS = (
+    "prod",
+    "production",
+    "online",
+    "master",
+    "live",
+    "release",
+    "staging",
+    "uat",
+    "pre",
+    "preprod",
+)
+_DB_NAME_RE = _re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
 def _is_safe_test_db(dbname: str) -> bool:
-    if not dbname:
+    """严格白名单：任何不满足的库名一律拒绝 DROP。"""
+    if not dbname or not isinstance(dbname, str):
         return False
-    d = dbname.lower()
-    if d == "xhs_test":
+    # 1) 字符集强约束：字母开头 + 字母数字下划线 <=64
+    if not _DB_NAME_RE.match(dbname):
+        return False
+    # 2) 绝对禁止的关键词（大小写不敏感）
+    low = dbname.lower()
+    for tok in _FORBIDDEN_DB_TOKENS:
+        if tok in low:
+            return False
+    # 3) 白名单匹配：精确 / 前缀 / 后缀（后缀必须整段是 xxx_test，且 xxx 段不得含 "test"，防 production_test 误匹配）
+    if low in _SAFE_TEST_DB_EXACT:
         return True
     for p in _SAFE_TEST_DB_PREFIXES:
-        if d.startswith(p):
+        if low.startswith(p):
             return True
-    for s in _SAFE_TEST_DB_SUFFIXES:
-        if d.endswith(s):
+    if low.endswith(_SAFE_TEST_DB_SUFFIX):
+        head = low[: -len(_SAFE_TEST_DB_SUFFIX)]
+        # head 不能再含 "test"（避免 production_test / test_prod 这类组合被放行）
+        if head and "test" not in head:
             return True
     return False
 
@@ -93,10 +126,17 @@ def _mysql_cleanup(settings: Settings) -> None:
     if not parsed:
         return
     user, password, host, port, database = parsed
+    # 再做一次字符集强校验（DROP 前最后一道门）
+    if not _DB_NAME_RE.match(database or ""):
+        print(
+            f"[SAFE] 跳过 DROP：database={database!r} 不满足 MySQL 合法库名字符集强约束。"
+        )
+        return
     if not _is_safe_test_db(database):
         print(
-            f"[SAFE] 跳过 DROP：database='{database}' 不匹配测试库模式 "
-            f"（允许：xhs_test、test_* 前缀、*_test 后缀），防止误删正式库。"
+            f"[SAFE] 跳过 DROP：database='{database}' 不匹配严格测试库白名单 "
+            f"（允许：xhs_test、xhs_test_*、test_*、xxx_test 且 xxx 不含 test/prod/online 等关键词），"
+            f"防止误删正式库。"
         )
         return
     import pymysql  # type: ignore

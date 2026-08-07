@@ -22,7 +22,7 @@ from backend.db import (
     TASK_STATUS_FAILED,
     TASK_STATUS_SUCCESS,
 )
-from backend.config import Settings
+from backend.core.config import Settings
 from backend.schemas import BusinessException, ErrorCode
 from sqlalchemy.orm import close_all_sessions
 
