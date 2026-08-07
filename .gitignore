@@ -1,0 +1,15 @@
+# 前端
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# 后端
+backend/__pycache__/
+backend/.env
+backend/uploads/
+
+# 通用
+*.log
+.DS_Store
+.vscode/
+.idea/
