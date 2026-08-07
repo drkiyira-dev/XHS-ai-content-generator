@@ -1,0 +1,52 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+uploads/*
+!uploads/.gitkeep
+
+*.db
+*.sqlite
+*.sqlite3
+
+# 禁止提交 MySQL data 目录
+mysql/data/
+data/mysql/
+**/mysql/data/**
+
+# 禁止提交 MySQL 表空间/表定义/套接字
+*.ibd
+*.frm
+*.sock
+*.pid
+*.log
+
+# 禁止提交 SQL dump / 业务数据备份
+*.sql.gz
+*.sql.bz2
+*.sql.zip
+# 纯 .sql 文件里 schema 可以提交；但真实业务数据 dump（如 backup_*.sql、dump_*.sql）需拒绝
+dump_*.sql
+backup_*.sql
+
+# 日志
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
