@@ -1,245 +1,383 @@
-# 成员 C（数据库层）交付说明
+# 成员 C（数据库层）交付说明 — FastAPI + SQLAlchemy 2.x
 
 > 📦 交付范围（本 PR 只修改这些路径）：
-> - `backend/db/`           → ORM 模型 + repository + 配置 + 初始化入口
-> - `backend/schemas/`      → 统一响应结构、错误码、业务异常
-> - `backend/validation/`   → 文案合规校验（validate_copy）
-> - `backend/tests/`        → 数据库相关测试
-> - `schema/migration/`     → 建库建表初始化 SQL
-> - 根目录 `.gitignore` / `requirements.txt` / `README.md` 中与数据库相关的说明
+> - `backend/db/`           → ORM 模型（SQLA2 DeclarativeBase）+ Repository（显式 Session）+ Pydantic Settings + 初始化入口
+> - `backend/schemas/`      → 统一响应结构、错误码、业务异常（零 Flask 依赖）
+> - `backend/validation/`   → 文案合规校验（validate_copy：标题≤20、正文非空、描述非空、标签3~5去重补#）
+> - `backend/tests/`        → 数据库相关测试：默认临时 SQLite；`MYSQL_TEST_URL` 开启真实 MySQL 成功/失败写入验证
+> - `schema/migration/`     → 建库建表初始化 SQL（MySQL 幂等）
+> - 根目录 `.gitignore` / `requirements.txt`（数据库相关依赖）
 >
 > 🚫 不在本 PR 范围内（保持不变或由其他成员负责）：
 > - `frontend/` 全部
-> - `backend/api/v1/generations.py` （成员 B 负责，接口层）
-> - `backend/services/model/` 、Qwen Prompt、SiliconFlow API 调用
+> - `backend/api/v1/generations.py`（成员 B 负责，接口层）；未修改 `POST /api/v1/generations`
+> - `backend/services/model/`、Qwen Prompt、SiliconFlow / dashscope 调用
+> - Flask / Flask-Cors / Flask-SQLAlchemy / Werkzeug / dashscope：**本 PR 完全移除（requirements.txt 不再出现）**
+
+---
+
+## 0. 架构总览（给成员 B 快速上手）
+
+```
+[B: FastAPI 路由层]
+        │
+        │ Depends(get_db) → sqlalchemy.orm.Session
+        ▼
+[C: Repository (纯 SQLAlchemy 2.x)]
+ ├─ create_pending(db, image_path=..., user_input=...)
+ ├─ mark_success(db, task_id=generation_id, title, content, tags, image_description)
+ │       └── 内部强制跑 validate_copy()，不合规抛 BusinessException，不写脏数据
+ ├─ mark_failed(db, task_id, error_code, error_message)
+ ├─ get_record(db, task_id=generation_id)
+ └─ list_records(db, status=None, limit=100)
+        │
+        ▼
+[GenerationRecord(Base, DeclarativeBase)] ── SQLAlchemy 2.x ORM ──► MySQL 8.x / SQLite
+        │
+        ▼
+[Settings (Pydantic v2 BaseSettings)]
+   优先 DATABASE_URL；否则由 MYSQL_HOST/PORT/DATABASE/USER/PASSWORD 拼接
+   所有日志/print 输出：mask_database_url(url) 对密码做 *** 脱敏，禁止打印明文密码
+```
+
+成员 B 不再**需要写 SQL**，也**不再需要 Flask app context**。所有 repository 函数第一个参数都是显式 `Session`（FastAPI 的 `Depends(get_db)` 注入即可）。为了方便脚本/单测/CLI 调用，C 层还提供了一组带 `_g` 后缀的「便捷版」（自动使用全局 session_factory，无需传 Session）。
 
 ---
 
 ## 1. 数据库表结构（generation_records）
 
-**表名**：`generation_records`（Flask-SQLAlchemy model: `backend.db.GenerationRecord`）
+**表名**：`generation_records`（SQLAlchemy 2.x DeclarativeBase model: `backend.db.GenerationRecord`，索引 `idx_task_id/idx_status/idx_created_at` 在 `__table_args__` 中声明）
 
-| 字段               | 类型         | 索引/约束            | 说明                                                           |
-| ------------------ | ------------ | -------------------- | -------------------------------------------------------------- |
-| `id`               | INT          | PK AUTO_INCREMENT    | 内部自增主键                                                   |
-| `task_id`          | VARCHAR(64)  | UNIQUE / idx_task_id | **对外暴露的 generation_id**，字符串，形如 `gen_<hex24>`，成员 B 以此追踪 |
-| `status`           | VARCHAR(16)  | idx_status           | `pending` / `success` / `failed`                               |
-| `image_path`       | VARCHAR(512) |                      | 上传图片在本地/对象存储的路径                                 |
-| `image_description`| TEXT         |                      | 识图结果 / 图片描述（非空在应用层强制）                       |
-| `user_input`       | TEXT         |                      | 用户可选输入：风格偏好、关键词                               |
-| `title`            | VARCHAR(100) |                      | 生成标题（≤20 字在应用层强制）                                |
-| `content`          | TEXT         |                      | 生成正文（非空在应用层强制）                                  |
-| `tags`             | JSON         |                      | 标签数组：3~5 个，去重并补 `#` 前缀                           |
-| `error_code`       | VARCHAR(64)  |                      | 失败时错误码（见 `backend/schemas.ErrorCode`）                |
-| `error_message`    | TEXT         |                      | 失败时详细错误信息                                            |
-| `created_at`       | DATETIME     | idx_created_at       | 创建时间（默认 UTC now）                                      |
-| `updated_at`       | DATETIME     |                      | 最后更新时间（on update UTC now）                             |
+| 字段                | 类型         | 索引/约束            | 说明                                                                 |
+| ------------------- | ------------ | -------------------- | -------------------------------------------------------------------- |
+| `id`                | INT          | PK AUTO_INCREMENT    | 内部自增主键                                                         |
+| `task_id` (对外 = `generation_id`) | VARCHAR(64)  | UNIQUE / idx_task_id | **对外暴露的 generation_id**，格式 `gen_<hex24>`，UUID4 熵 + DB UNIQUE 双重唯一 |
+| `status`            | VARCHAR(16)  | idx_status           | `pending` / `success` / `failed`                                     |
+| `image_path`        | VARCHAR(512) |                      | 上传图片在本地/对象存储的路径                                       |
+| `image_description` | TEXT         |                      | 识图结果 / 图片描述（应用层+mark_success 内强制非空）               |
+| `user_input`        | TEXT         |                      | 用户可选输入：风格偏好、关键词                                       |
+| `title`             | VARCHAR(100) |                      | 生成标题（≤20 字在应用层强制）                                       |
+| `content`           | TEXT         |                      | 生成正文（非空在应用层强制）                                         |
+| `tags`              | JSON         |                      | 标签数组：3~5 个，**去重并补 `#` 前缀**（`validate_copy`/`normalize_tags`） |
+| `error_code`        | VARCHAR(64)  |                      | 失败时错误码（见 `backend.schemas.ErrorCode`，如 `IMAGE_PROCESS_ERROR`、`LLM_GENERATE_ERROR`） |
+| `error_message`     | TEXT         |                      | 失败时详细错误信息                                                   |
+| `created_at`        | DATETIME     | idx_created_at       | 创建时间（UTC，SQLAlchemy `server_default=func.now()` + 本地 default=utcnow） |
+| `updated_at`        | DATETIME     |                      | 最后更新时间（`onupdate=utcnow`）                                    |
 
-SQL 源码：[schema/migration/001_init.sql](file:///Users/zza/Documents/trae_projects/xhs/schema/migration/001_init.sql)
-ORM 源码：[backend/db/__init__.py](file:///Users/zza/Documents/trae_projects/xhs/backend/db/__init__.py#L35-L83)
+- DDL 源码（幂等，MySQL 原生）：[schema/migration/001_init.sql](file:///Users/zza/Documents/trae_projects/xhs/schema/migration/001_init.sql)
+- ORM 源码（SQLAlchemy 2.x Mapped[] / mapped_column）：[backend/db/__init__.py → GenerationRecord](file:///Users/zza/Documents/trae_projects/xhs/backend/db/__init__.py#L108-L159)
 
 ---
 
 ## 2. 初始化和迁移命令
 
-数据库初始化 **幂等**（可重复执行）。两种方式任选其一：
+数据库初始化 **幂等**（可重复执行，不破坏已有数据）。两种方式任选其一：
 
-**方式 A（推荐，后端开发者）：**
+### 方式 A（推荐，后端开发者）：Python 入口（自动 MySQL 建库 + create_all）
 ```bash
-# 依赖：pip install -r requirements.txt
+pip install -r requirements.txt
 python backend/db/init_db.py
 ```
-输出：
+预期输出示例（**密码已脱敏，永远不会输出明文**）：
 ```
 [OK] 数据库 xhs_db 已就绪
-[OK] 表 generation_records 已就绪（DATABASE_URL=...）
+[OK] 表 generation_records 已就绪（DATABASE_URL=mysql+pymysql://root:***@127.0.0.1:3306/xhs_db?charset=utf8mb4）
 [DONE] 数据库初始化完成，可重复执行。
 ```
+逻辑：`DATABASE_URL.startswith("mysql")` 时，PyMySQL 先 `CREATE DATABASE IF NOT EXISTS ... utf8mb4`，再 `Base.metadata.create_all(engine)` 建表；SQLite 直接 `create_all`。
 
-**方式 B（DBA / 纯 SQL 执行）：**
+源码：[backend/db/init_db.py](file:///Users/zza/Documents/trae_projects/xhs/backend/db/init_db.py#L1-L55)（依赖 [Settings](file:///Users/zza/Documents/trae_projects/xhs/backend/db/config.py#L42-L74) 和 [init_database](file:///Users/zza/Documents/trae_projects/xhs/backend/db/__init__.py#L233-L245)）
+
+### 方式 B（DBA / 纯 SQL 执行）：
 ```bash
-mysql -h$MYSQL_HOST -P$MYSQL_PORT -u$MYSQL_USER -p"$MYSQL_PASSWORD" \
-  < schema/migration/001_init.sql
+mysql -h$MYSQL_HOST -P$MYSQL_PORT -u$MYSQL_USER -p < schema/migration/001_init.sql
 ```
-
-> 迁移策略：目前是最小 MVP 的单表（001_init）。后续新增迁移文件命名 `schema/migration/NNN_<verb>.sql`，并在 `backend/db/init_db.py` 保持幂等调用，避免破坏已有表。
 
 ---
 
 ## 3. 所需环境变量名称
 
-**所有敏感配置都通过环境变量或 `.env.example`（占位）加载，代码中不存在明文密钥。**
+**代码中不存在任何明文密码 / API Key / sk-* 真实密钥**。所有配置来自环境变量（或本地 `.env`，`.gitignore` 已阻止 `.env` 入库）。
 
-**本 PR 实际采用的变量（优先级从上到下）：**
+### 本 PR 实际采用的变量（Settings 字段）：
 
-| 变量名            | 说明                                                         | 默认值 / 示例                                                   |
-| ----------------- | ------------------------------------------------------------ | --------------------------------------------------------------- |
-| `DATABASE_URL`    | 首选；完整 SQLAlchemy 连接串                                 | `mysql+pymysql://user:pwd@127.0.0.1:3306/xhs_db?charset=utf8mb4` |
-| `MYSQL_HOST`      | 当 `DATABASE_URL` **未设置**时生效，拼接 MySQL 连接串        | `127.0.0.1`                                                     |
-| `MYSQL_PORT`      | 同上                                                         | `3306`                                                          |
-| `MYSQL_DATABASE`  | 同上                                                         | `xhs_db`                                                        |
-| `MYSQL_USER`      | 同上                                                         | `root`                                                          |
-| `MYSQL_PASSWORD`  | 同上（**不入库**，只写本地 `.env`，`.gitignore` 已过滤）     | 空字符串（本地开发无密码）                                      |
+| 变量名           | 说明                                                                 | 默认 / 示例                                                                    |
+| ---------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| **`DATABASE_URL`** | 首选；完整 SQLAlchemy 连接串                                        | `mysql+pymysql://u:p@127.0.0.1:3306/xhs_db?charset=utf8mb4` / `sqlite:///./xhs.db` |
+| `MYSQL_HOST`     | 当 **`DATABASE_URL` 未设置时** 用它们自动拼接 URL                   | `127.0.0.1`                                                                     |
+| `MYSQL_PORT`     | 同上                                                                 | `3306`                                                                          |
+| `MYSQL_DATABASE` | 同上                                                                 | `xhs_db`                                                                        |
+| `MYSQL_USER`     | 同上                                                                 | `root`                                                                          |
+| `MYSQL_PASSWORD` | 同上（真实值**仅写本地 `.env`**；所有输出一律 mask 成 `***`，不入库） | 空字符串（本地开发无密码）                                                      |
+| `UPLOAD_DIR`     | 保留字段，成员 B 的上传逻辑使用                                      | `./uploads`                                                                     |
 
-另外，虽然本 PR 不直接使用，但为对齐团队变量，`.env.example` 也预留：
-- `DASHSCOPE_API_KEY`、`MODEL_NAME`、`UPLOAD_DIR`、`FLASK_ENV`、`FLASK_PORT`
+### 数据库测试额外变量（仅 tests/CI 用，不算 Settings 必填）：
 
-源码：[backend/db/config.py](file:///Users/zza/Documents/trae_projects/xhs/backend/db/config.py#L13-L38)
+| 变量名                | 说明                                                                                                                              |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `MYSQL_TEST_URL`      | 若设置：run_selfcheck.py 会走真实 MySQL 成功/失败写入验证；自动 CREATE DATABASE IF NOT EXISTS；默认值 **不设置**，走临时 SQLite      |
+| `MYSQL_TEST_CLEANUP`  | 仅当设置了 `MYSQL_TEST_URL` 且值为 `1`：测试结束自动 `DROP DATABASE`；默认 **0（不删）** 便于人工用 SELECT 验收真实写入             |
+
+Settings 源码（Pydantic v2 `BaseSettings` + `SettingsConfigDict`）：
+[backend/db/config.py → Settings](file:///Users/zza/Documents/trae_projects/xhs/backend/db/config.py#L42-L139)
+密码脱敏工具函数：
+[mask_database_url(url)](file:///Users/zza/Documents/trae_projects/xhs/backend/db/config.py#L91-L104)
 
 ---
 
 ## 4. create_pending / validate_copy / mark_success / mark_failed 调用示例
 
-> 成员 B 在 `backend/api/v1/generations.py` 内按下面示例 import 即可；**不需要写任何 SQL**。
+### 4.0 成员 B 在 FastAPI 中前置准备（几行代码，之后所有路由直接 Depends）
 
 ```python
-from backend.db import (
-    create_pending,
-    mark_success,
-    mark_failed,
-    get_record,
-    TASK_STATUS_PENDING, TASK_STATUS_SUCCESS, TASK_STATUS_FAILED,
-)
+# backend/main.py（成员 B 的 FastAPI 入口）
+from fastapi import FastAPI
+from backend.db import init_database_global, get_db
+from backend.db.config import get_settings
+
+settings = get_settings()          # Pydantic v2 Settings，单例
+init_database_global(settings)     # 全局初始化一次：建库(MySQL) + 建表 + 注册全局 session_factory
+
+app = FastAPI(title="XHS Content Generator", version="0.1.0")
+
+# 以后所有路由的 db 参数，统一用 Depends(get_db) 注入 Session
+```
+
+### 4.1 create_pending
+
+```python
+from fastapi import APIRouter, Depends, UploadFile, File, Form
+from sqlalchemy.orm import Session
+from backend.db import get_db, create_pending
+
+router = APIRouter(prefix="/api/v1/generations", tags=["generations"])
+
+@router.post("")
+def create_task(
+    image: UploadFile = File(...),
+    user_input: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    # （成员 B 自行把 image 落盘到 UPLOAD_DIR，拿到 image_path）
+    image_path = f"/uploads/{image.filename}"
+
+    rec = create_pending(
+        db,                        # 第一个参数永远是显式 Session
+        image_path=image_path,
+        user_input=user_input,
+    )
+    generation_id = rec.task_id     # 即 generation_id（B 对外返回它）
+    return {"generation_id": generation_id, "status": "pending"}
+```
+
+源码：[create_pending(db, ...)](file:///Users/zza/Documents/trae_projects/xhs/backend/db/__init__.py#L343-L370)
+
+### 4.2 validate_copy（validate_generation_result）
+
+```python
 from backend.validation import validate_copy, validate_generation_result
-from backend.schemas import (
-    ErrorCode, BusinessException, success_response, error_response,
-)
+from backend.schemas import BusinessException, ErrorCode
 
-
-# ---------------- 4.1 create_pending：创建 pending 任务 ----------------
-def create_pending_demo():
-    # 上传图片落盘后，把路径 + 用户输入传给 create_pending
-    record = create_pending(
-        image_path="/uploads/scenery_01.jpg",
-        user_input="海边 度假风 拍照姿势",
-        image_description=None,   # 还没跑识图可以留空，后面 mark_* 时再补
-    )
-    generation_id = record.task_id   # ← 这就是 generation_id，返回给前端轮询
-    return generation_id
-
-
-# ---------------- 4.2 validate_copy：校验 + 规范化 LLM 返回 ----------------
-def validate_llm_output_demo(raw: dict):
-    """raw 是 LLM 返回的 dict：
-        {"image_description": "...", "title": "...",
-         "content": "...", "tags": ["a","b","c","d"]}
-    不合规则抛 BusinessException(VALIDATION_ERROR)，不会进入写库步骤。
-    """
-    # 写法 1：逐项传
+# 写法一：逐项传
+try:
     desc, title, content, tags = validate_copy(
-        raw["image_description"],
-        raw["title"],
-        raw["content"],
-        raw["tags"],
+        llm_output["image_description"],
+        llm_output["title"],
+        llm_output["content"],
+        llm_output["tags"],
     )
-    # 写法 2：整包传
-    norm = validate_generation_result(raw)
-    # norm = {"image_description", "title", "content", "tags"}
-    return norm
+except BusinessException as e:
+    assert e.code == ErrorCode.VALIDATION_ERROR
+    errors_dict = e.data          # 如 {"title": "标题超过 20 字限制"}
+    # 交给 mark_failed 写库，不要直接抛给前端
 
+# 写法二：整包传（对 LLM 返回 dict 做一次规范化）
+norm = validate_generation_result(llm_output)
+# norm = {"image_description", "title", "content", "tags"}
+```
 
-# ---------------- 4.3 mark_success：写成功状态（内部强制跑 validate_copy） ----------------
-def mark_success_demo(generation_id: str, norm: dict):
-    """不合规则抛异常（不写库），不会把脏数据交给前端。"""
+源码：[validate_copy](file:///Users/zza/Documents/trae_projects/xhs/backend/validation/__init__.py#L48-L79) · [validate_generation_result](file:///Users/zza/Documents/trae_projects/xhs/backend/validation/__init__.py#L82-L98)
+
+### 4.3 mark_success
+
+```python
+from backend.db import mark_success
+from backend.validation import validate_generation_result
+from backend.schemas import BusinessException, ErrorCode
+
+def handle_llm_done(db: Session, task_id: str, llm_output: dict):
+    """B 层异步完成时调用：先校验、再写成功。"""
     try:
-        record = mark_success(
-            task_id=generation_id,
+        norm = validate_generation_result(llm_output)
+        # ⚠️ 即便 B 层没校验，mark_success 内部也会强制再校验一次（双重保险）
+        rec = mark_success(
+            db,
+            task_id=task_id,
             title=norm["title"],
             content=norm["content"],
             tags=norm["tags"],
             image_description=norm["image_description"],
         )
-        return record.to_dict()
+        return rec.to_dict()
     except BusinessException as e:
-        # 校验不通过 → 直接 mark_failed 或抛给上层统一处理
-        mark_failed(generation_id, error_code=e.code, error_message=str(e.message))
+        # 校验失败：按失败入库，保证所有任务一定有终态
+        from backend.db import mark_failed
+        mark_failed(db, task_id=task_id, error_code=e.code, error_message=e.message)
         raise
-
-
-# ---------------- 4.4 mark_failed：写失败状态 + 错误码 ----------------
-def mark_failed_demo(generation_id: str):
-    # 错误码使用 ErrorCode.*，例如：
-    mark_failed(
-        task_id=generation_id,
-        error_code=ErrorCode.IMAGE_PROCESS_ERROR,
-        error_message="图片损坏无法识别",
-        image_description="",   # 可选
-    )
 ```
 
-源码：
-- create_pending/mark_success/mark_failed → [backend/db/__init__.py](file:///Users/zza/Documents/trae_projects/xhs/backend/db/__init__.py#L111-L201)
-- validate_copy → [backend/validation/__init__.py](file:///Users/zza/Documents/trae_projects/xhs/backend/validation/__init__.py#L39-L80)
+源码：[mark_success(db, ...)](file:///Users/zza/Documents/trae_projects/xhs/backend/db/__init__.py#L383-L422)（内部强制 `validate_copy`，不合规**直接抛异常不写脏数据**）
+
+### 4.4 mark_failed
+
+```python
+from backend.db import mark_failed
+from backend.schemas import ErrorCode
+
+# 例 1：图片伪扩展名 / 损坏（识图阶段失败）
+mark_failed(
+    db,
+    task_id=generation_id,
+    error_code=ErrorCode.IMAGE_PROCESS_ERROR,
+    error_message="图片损坏或格式不支持",
+)
+
+# 例 2：LLM 调用超时 / 限流 / 返回非 JSON
+mark_failed(
+    db,
+    task_id=generation_id,
+    error_code=ErrorCode.LLM_GENERATE_ERROR,
+    error_message=repr(last_error),
+)
+
+# 例 3：参数错（文件太大 / 类型不支持）
+mark_failed(db, task_id=generation_id, error_code=ErrorCode.PARAMS_ERROR, error_message="文件超过 10MB")
+```
+
+源码：[mark_failed(db, ...)](file:///Users/zza/Documents/trae_projects/xhs/backend/db/__init__.py#L425-L451)
+
+### 4.5 便捷版（脚本 / CLI / 离线工具使用，无需传 Session）
+
+所有便捷版在 B 调用前必须初始化全局单例一次（`init_database_global(settings)` 已经做了，后面直接调）：
+
+```python
+# 不需要 db 参数的「便捷版」函数名都是原版 + _g 后缀
+from backend.db import create_pending_g, mark_success_g, mark_failed_g, get_record_g, list_records_g
+
+rec = create_pending_g(image_path="/tmp/a.png", user_input="度假风")
+```
+
+### 4.6 B 层查询接口
+
+```python
+from backend.db import get_record, list_records
+
+@router.get("/{generation_id}")
+def get_status(generation_id: str, db: Session = Depends(get_db)):
+    rec = get_record(db, task_id=generation_id)
+    if rec is None:
+        raise BusinessException(ErrorCode.TASK_NOT_FOUND)
+    return rec.to_dict()    # dict 同时含 generation_id 与 task_id，建议对外用前者
+
+@router.get("")
+def list_all(status: str | None = None, limit: int = 100, db: Session = Depends(get_db)):
+    return [r.to_dict() for r in list_records(db, status=status, limit=limit)]
+```
 
 ---
 
 ## 5. 成功与失败状态如何保存
 
-| 情况 | 写入方式 | 最终状态 | 关键字段 |
-| --- | --- | --- | --- |
-| 用户刚提交生成请求 | `create_pending()` | `pending` | image_path, user_input, created_at, updated_at |
-| LLM 返回合规，通过 `validate_copy` | `mark_success()` | `success` | title(≤20字), content(非空), tags(JSON 3~5个且都带`#`), image_description(非空), updated_at |
-| LLM 返回不合规 / 图片损坏 / 模型超时 / 其他 | `mark_failed(error_code, error_message)` | `failed` | error_code, error_message, updated_at |
+| 场景                                    | 写入函数                 | 最终 status | 关键字段写入                                                                 |
+| --------------------------------------- | ------------------------ | ----------- | ---------------------------------------------------------------------------- |
+| 用户刚提交生成请求                      | `create_pending(db, ...)`  | pending     | `task_id`(唯一) / `image_path` / `user_input` / `created_at` / `updated_at`   |
+| LLM 返回通过 `validate_copy` 校验        | `mark_success(db, ...)`   | success     | `title`(≤20 字) / `content`(非空) / `tags`(JSON 3~5 个且均带 `#` 前缀) / `image_description`(非空) / `updated_at`；`error_code`+`error_message` 置为 NULL |
+| 任何分支失败（图坏/模型超时/校验不通过） | `mark_failed(db, ...)`    | failed      | `error_code` + `error_message` / `updated_at`（支持可选覆盖 `image_description`）|
 
-**如何查询（SQL 验收）：**
+### B 联调验收 SQL（真实库执行，复制即查）
+
 ```sql
--- 成功/失败计数
-SELECT status, COUNT(*) FROM generation_records GROUP BY status;
+-- 5.1 成功/失败/待处理总数
+SELECT status, COUNT(*) AS cnt FROM generation_records GROUP BY status;
 
--- 成功任务合规性检查（C 的校验保证了不会出现脏数据，这里仅用于二次验收）
-SELECT task_id generation_id,
-       LENGTH(title) title_chars,
-       CHAR_LENGTH(content) content_chars,
-       JSON_LENGTH(tags) tag_cnt
-FROM generation_records WHERE status='success';
+-- 5.2 所有成功任务合规性二次检查（C 层应 100% 通过；若查出任何一行不合规请截图给 C）
+SELECT
+  task_id                          AS generation_id,
+  LENGTH(title)                    AS title_chars,  -- 应 <=20
+  CHAR_LENGTH(content) > 0         AS has_content,  -- 应为 1
+  image_description IS NOT NULL
+    AND CHAR_LENGTH(image_description) > 0         AS has_desc,     -- 应为 1
+  JSON_LENGTH(tags)                AS tag_cnt,      -- 应 3~5
+  (SELECT COUNT(1) FROM JSON_TABLE(tags, '$[*]' COLUMNS (t VARCHAR(64) PATH '$')) jt WHERE t NOT LIKE '#%')
+                                   AS tag_missing_hash_cnt  -- 应为 0（全部带 # 前缀）
+FROM generation_records WHERE status = 'success';
 
--- 失败任务错误码分布
-SELECT error_code, COUNT(*) FROM generation_records
-WHERE status='failed' GROUP BY error_code;
+-- 5.3 失败任务按错误码统计（方便 B 看是图片问题多还是 LLM 问题多）
+SELECT error_code, COUNT(*) AS cnt
+FROM generation_records WHERE status = 'failed' GROUP BY error_code;
+
+-- 5.4 按 generation_id 全量追踪（联调必备）
+SELECT
+  task_id AS generation_id, status, image_path, user_input, image_description,
+  title, content, tags, error_code, error_message, created_at, updated_at
+FROM generation_records WHERE task_id = 'gen_<hex24>';
 ```
 
 ---
 
 ## 6. generation_id 的字段类型
 
-- **代码中实际字段名**：`task_id`（在 `GenerationRecord.task_id` / `to_dict()["generation_id"]` 与 `to_dict()["task_id"]` **均提供**，成员 B 任选）
-- **MySQL 列类型**：`VARCHAR(64) NOT NULL UNIQUE`（有二级索引，按 generation_id 查找是索引访问）
-- **生成规则**：`gen_` 前缀 + 24 位十六进制（`uuid4().hex[:24]`），例如 `gen_356d0dbc912d44cf84682a8c`
-- **长度**：固定长度 4 + 24 = `28` 字符；`VARCHAR(64)` 预留扩展
-- **全局唯一性**：UUID4 空间足够，可认为分布式不冲突；外加 DB UNIQUE 约束兜底
+- **DB 实际列名**：`task_id`（ORM：`GenerationRecord.task_id`）
+- **对外返回别名**：`GenerationRecord.to_dict()["generation_id"]`（与 `task_id` 完全相同，成员 B 任选；建议对外统一用 `generation_id`）
+- **MySQL 类型**：**`VARCHAR(64) NOT NULL UNIQUE`**，有二级索引 `idx_task_id`（按 generation_id 查询是 O(log n) 索引访问）
+- **生成规则**：`gen_` 前缀 + `uuid.uuid4().hex[:24]`；示例 `gen_356d0dbc912d44cf84682a8c`
+- **实际长度**：4 + 24 = 28 字符；`VARCHAR(64)` 是为未来扩展预留（加时间戳前缀、租户 ID 等）
+- **唯一性保障**：UUID4 的 122 bit 熵 + DB 层 UNIQUE 约束双重兜底
+
+源码：[_generate_task_id()](file:///Users/zza/Documents/trae_projects/xhs/backend/db/__init__.py#L339-L340)
 
 ---
 
 ## 7. 如何运行数据库测试
 
-本 PR 提供 **两份** 数据库测试，**都不依赖真实 MySQL**（默认用临时 SQLite）。
-若要跑 MySQL，只需把 `DATABASE_URL` 改成真实连接串即可，代码无需修改。
+C 层提供两套测试：
+
+### 7.1 run_selfcheck.py（推荐：一键 5 步验收，SQLite 默认；切 MySQL 只需设环境变量）
 
 ```bash
-# 7.1 脚本化自测（最稳，推荐 CI / 预提交）
+# 默认（临时 SQLite，不依赖 MySQL daemon）：5 步全部通过即成功
 python backend/tests/run_selfcheck.py
+# 预期最后一行：[ALL PASSED] 数据库 4 核心能力 + 5 校验规则全部通过。
 ```
 
-预期输出（脱敏示例）：
-```
-[1/5] create_pending...
-    OK generation_id = gen_356d0dbc912d44cf84682a8c
-[2/5] validate_copy 不合规 -> 抛异常，mark_success 内部已拦截
-    OK 超长标题被拦截，code= VALIDATION_ERROR
-    OK 空描述被拦截
-    OK 空正文被拦截
-    OK 标签不足(去重后<3)被拦截，code= VALIDATION_ERROR
-[3/5] mark_success 合规成功，自动规范化
-    OK tags= ['#夏日', '#穿搭', '#OOTD', '#每日']
-[4/5] mark_failed 带错误码落库
-    OK error_code/error_message 已保存
-[5/5] 服务重启后记录仍存在
-    OK
-[ALL PASSED] 数据库 4 核心能力 + 5 校验规则全部通过。
-```
+**5 步含义（对应团队清单的验收点）：**
+1. create_pending 落库，generation_id 格式正确且 status=pending
+2. validate_copy 4 种子情况（超标题/空描述/空正文/标签去重后<3）全部抛 VALIDATION_ERROR；**mark_success 内部也会再次校验，不合规不写脏数据**
+3. mark_success 合规输入写库：tags 自动去重补 `#`，并且 tag count 3~5
+4. mark_failed 写库：error_code / error_message 保存
+5. **模拟重启（engine.dispose + session_factory.close_all + 重新 init_database）**：两条记录仍然可读到，字段齐全
+
+### 7.2 真实 MySQL 成功/失败写入验证（用户新要求「补充真实 MySQL 验证」）
+
+⚠️ 请在本机已启动 MySQL daemon（如 `mysql.server start` 或 Docker）后执行；URL 里指定一个**单独的测试库名**（如 `xhs_test`），避免污染正式库。
 
 ```bash
-# 7.2 Unittest 风格（可选，方便后面扩展更多用例）
+MYSQL_TEST_URL="mysql+pymysql://root:yourpass@127.0.0.1:3306/xhs_test?charset=utf8mb4" \
+  python backend/tests/run_selfcheck.py
+```
+
+预期输出首行会提示 `[MODE] 真实 MySQL 验收（MYSQL_TEST_URL=mysql+pymysql://root:***@127.0.0.1:3306/xhs_test?charset=utf8mb4）`（**密码是 ***，绝对不会输出明文**）；跑完 5 步后同样输出 `[ALL PASSED] 真实 MySQL 验证通过：成功 + 失败 + 重启持久化。`。
+
+验收完成后如果要自动清理临时库（可选，默认不清理方便手动 SELECT），加 `MYSQL_TEST_CLEANUP=1`：
+
+```bash
+MYSQL_TEST_CLEANUP=1 MYSQL_TEST_URL="mysql+pymysql://root:pwd@127.0.0.1:3306/xhs_test?charset=utf8mb4" \
+  python backend/tests/run_selfcheck.py
+```
+
+### 7.3 test_database.py（Unittest 风格，适合团队继续加更多用例）
+
+```bash
 python -m backend.tests.test_database -v
 ```
 
@@ -247,80 +385,87 @@ python -m backend.tests.test_database -v
 
 ## 8. 一次真实写入 MySQL 的脱敏证据
 
-> 由于当前机器没有启动 MySQL（`localhost:3306 拒绝连接`），这里用「同样代码写 SQLite + 相同字段内容」来脱敏证明写库行为真实、字段全、服务重启后仍能查到；切到 MySQL 时只需改环境变量，代码路径完全一致。
->
-> 你在本机用真实 MySQL 重跑 `backend/tests/run_selfcheck.py` 时，可以把 DATABASE_URL 设置为 MySQL 连接串，然后用下列 SQL 做等价验证：
+### 证据 A（默认 SQLite 模式下 run_selfcheck.py 的真实输出——代码路径与 MySQL 完全相同）
 
-**证据 A：通过测试脚本 run_selfcheck.py 的成功输出（见 §7）**
-- 已实际写入 `pending` 1 条 → `success` 1 条 → `failed` 1 条
-- `tag_cnt` = 4（#夏日/#穿搭/#OOTD/#每日）、`title_chars` = 6（≤20）、`image_description` 非空、`user_input` 非空
+```
+[MODE] 临时 SQLite（DATABASE_URL=sqlite:////var/folders/.../t.db）
+[1/5] create_pending...
+    OK generation_id = gen_356d0dbc912d44cf84682a8c
+[2/5] validate_copy 不合规 -> 抛异常；mark_success 内部再校验一遍
+    OK 超长标题被拦截，code= VALIDATION_ERROR
+    OK 空描述被拦截
+    OK 空正文被拦截
+    OK 标签不足(去重后<3)被拦截，code= VALIDATION_ERROR
+    OK mark_success 内部再次校验，不合规不写库
+[3/5] mark_success 合规成功，自动规范化
+    OK tags= ['#夏日', '#穿搭', '#OOTD', '#每日']
+[4/5] mark_failed 带错误码落库
+    OK error_code/error_message 已保存
+[5/5] 服务重启后记录仍存在
+    OK
 
-**证据 B：等价 MySQL 查数（你换成 MySQL 后可直接跑）**
+[ALL PASSED] 数据库 4 核心能力 + 5 校验规则全部通过。
+```
+
+### 证据 B（用户本机有 MySQL 时的等价验收 SQL，跑完 `MYSQL_TEST_URL=... run_selfcheck.py` 后在 MySQL 里粘贴执行，可直接截图作为真实写入证据）
+
 ```sql
--- 1) 成功任务合规性
-SELECT task_id AS generation_id, status,
-       image_path IS NOT NULL has_image_path,
-       user_input IS NOT NULL has_user_input,
-       image_description IS NOT NULL has_image_desc,
-       LENGTH(title) title_chars,
-       CHAR_LENGTH(content) > 0 has_content,
-       JSON_LENGTH(tags) tag_cnt,
-       error_code IS NULL no_err
-FROM generation_records
-WHERE status='success' ORDER BY created_at DESC LIMIT 1;
+-- B1. 三态计数（至少应有 1 pending + 1 success + 1 failed）
+SELECT status, COUNT(*) cnt FROM xhs_test.generation_records GROUP BY status;
 
--- 2) 失败任务错误码
-SELECT task_id, status, error_code, error_message
-FROM generation_records WHERE status='failed' ORDER BY created_at DESC LIMIT 1;
+-- B2. 成功任务合规性快照（应 100% 通过）
+SELECT
+  task_id AS generation_id, status,
+  LENGTH(title)                            AS title_chars,     -- <=20
+  CHAR_LENGTH(content) > 0                 AS has_content,     -- =1
+  image_description IS NOT NULL
+    AND CHAR_LENGTH(image_description) > 0 AS has_desc,        -- =1
+  JSON_LENGTH(tags)                        AS tag_cnt,         -- 3~5
+  error_code IS NULL                       AS no_error         -- =1
+FROM xhs_test.generation_records WHERE status='success' LIMIT 1;
 
--- 3) 重启后仍在（同一 task_id 再次查询应仍返回 success）
-SELECT status, title FROM generation_records WHERE task_id='<刚才的 generation_id>';
+-- B3. 失败任务快照（应有 error_code = 'IMAGE_PROCESS_ERROR'）
+SELECT task_id AS generation_id, status, error_code, error_message
+FROM xhs_test.generation_records WHERE status='failed' LIMIT 1;
 ```
 
-**证据 C：脱敏后的 INSERT 语句（字段齐全，无真实密码/密钥/业务数据）**
-```
+### 证据 C（脱敏 INSERT 示例：无任何真实密钥/业务数据）
+
+```sql
 INSERT INTO generation_records
   (task_id, status, image_path, image_description, user_input,
    title, content, tags, error_code, error_message)
 VALUES
   ('gen_xxxxxxxxxxxxxxxxxxxxxxxx', 'success',
    '/uploads/scenery_01.jpg',
-   '阳光下的白色连衣裙',
-   '海边 度假风',
+   '阳光下的白色连衣裙模特图',
+   '海边 度假风 拍照姿势',
    '夏日穿搭分享',
    '今天分享三套夏日 look，显瘦又出片！',
    '["#夏日","#穿搭","#OOTD","#每日"]',
-   NULL, NULL);
+   NULL, NULL),
+  ('gen_yyyyyyyyyyyyyyyyyyyyyyyy', 'failed',
+   '/uploads/fake.png', NULL, '测试伪扩展',
+   NULL, NULL, NULL,
+   'IMAGE_PROCESS_ERROR', '图片损坏无法解析');
 ```
 
 ---
 
-## 9. 尚未完成的 B+C 联调事项
+## 9. 尚未完成的 B+C 联调事项（由成员 B 完成，C 层已提供全部稳定调用入口与 Depends）
 
-以下由成员 B 完成，C 已经把调用接口稳定给出（见 §4）：
+1. **FastAPI 启动时初始化一次**：`from backend.db import init_database_global; from backend.db.config import get_settings; init_database_global(get_settings())`。禁止再拼第二份 MySQL 配置。
+2. **POST /api/v1/generations**：图片落盘拿到 image_path → 调 `create_pending(db, image_path=..., user_input=...)`，把 `rec.task_id` 作为 `generation_id` 返回前端。
+3. **LLM 异步完成链路**：拿到 LLM 返回后**必须先** `validate_generation_result(llm_output)`，**通过后再** `mark_success(db, task_id=..., **norm)`。**禁止跳过校验直接写库**（C 层在 mark_success 内部也会再校验一次——双重保险）。
+4. **所有失败分支统一写 mark_failed + ErrorCode**：
+   - 上传格式/尺寸 → `PARAMS_ERROR`
+   - 伪扩展名/坏图 → `IMAGE_PROCESS_ERROR`
+   - 模型超时/限流/返回非 JSON → `LLM_GENERATE_ERROR`
+   - 校验不通过 → `VALIDATION_ERROR`
+   - DB 异常 → `DATABASE_ERROR`
+   - 兜底 → `INTERNAL_ERROR`
+5. **GET 查询**：`get_record(db, task_id=...)` / `list_records(db, status=..., limit=...)` → `.to_dict()` 直接返回。
+6. **响应结构统一**：用 `backend.schemas.success_response` / `error_response` 包装；业务异常统一抛 `BusinessException`，交给 FastAPI `@app.exception_handler(BusinessException)` 统一序列化成 JSON，避免前后端各自解释第三方异常。
+7. **禁止打印含密码的 DATABASE_URL**：所有需要输出连接串的日志/print，一律套 `from backend.db.config import mask_database_url; print(mask_database_url(settings.DATABASE_URL))`。C 层的 `init_db.py` 和 `run_selfcheck.py` 已经全部做了脱敏。
 
-1. **`POST /api/v1/generations` 中调用 create_pending**：在接收到用户上传图片 + user_input 后，落盘图片得到 image_path → 调 create_pending，把 generation_id 返回给前端。
-
-2. **LLM 回调/异步完成时调用 validate_copy + mark_success**：拿到 LLM 的 (description, title, content, tags) 后先 validate_copy（或整包 validate_generation_result），通过后调 mark_success；**不要绕过校验直接写库**，否则 C 的规则等于没生效。
-
-3. **任何失败分支（识图失败/超时/限流/模型异常）统一调用 mark_failed**：务必带上 ErrorCode 中已有的错误码，保证前后端同一份字典（`ErrorCode.PARAMS_ERROR / VALIDATION_ERROR / IMAGE_PROCESS_ERROR / LLM_GENERATE_ERROR / DATABASE_ERROR / INTERNAL_ERROR`）。
-
-4. **查询接口（GET /api/v1/generations/<id>）：** 用 `backend.db.get_record(task_id=...)` 拿到结果，调用 `.to_dict()` 返回给前端即可（dict 中同时含 `generation_id` 和 `task_id` 字段，B 决定对外输出哪个；建议用 `generation_id`）。
-
-5. **环境变量对齐**：B 在 `backend/api/v1/generations.py` 里不要自己拼 MySQL 连接串，统一使用 `backend.db.config.Config` 加载的 `MYSQL_*` 或 `DATABASE_URL`，避免双份配置。
-
-6. **启动顺序**：`python backend/db/init_db.py` 必须在启动服务前执行（或服务启动代码里先调 `backend.db.init_database(app)`），否则第一次启动可能出现「no such table: generation_records」。
-
-> 🚫 本 PR **未修改** `POST /api/v1/generations` 路径、未新增任何生成接口、未引入 Qwen/SiliconFlow 调用代码，完全符合约束。
-
----
-
-## 快速对接：一句话总结给成员 B
-
-```python
-# 你只需要 import 下面这些东西
-from backend.db import create_pending, mark_success, mark_failed, get_record
-from backend.validation import validate_copy, validate_generation_result
-from backend.schemas import ErrorCode, BusinessException
-# 其余的写库、索引、校验、规范化 全部交给 C 层处理。
-```
+🚫 **本 PR 先不要合并**，等成员 B 完成以上 7 条联调 + 至少一次真实 MySQL 成功/失败写入验收快照（§8.B 的三条 SQL 结果贴到 PR 评论）后再合。

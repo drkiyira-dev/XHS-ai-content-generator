@@ -1,78 +1,55 @@
-"""数据库初始化 & 验证脚本。
+"""数据库初始化 & 验证脚本（FastAPI + 纯 SQLAlchemy 2.x）。
 
-支持 MySQL / SQLite：
-    - 若设置了 DATABASE_URL 且是 mysql+pymysql:// 前缀，则用 PyMySQL 先建库再 SQLAlchemy 建表
-    - 否则按 DATABASE_URL（默认 sqlite:///./xhs.db）用 SQLAlchemy create_all() 建表
+幂等（可重复执行，不破坏已有数据）。
+
+用法：
+    python backend/db/init_db.py
+
+支持：
+    - 若 DATABASE_URL 是 mysql+pymysql://...，先用 PyMySQL 建库，再 SQLAlchemy create_all 建表
+    - 其他情况（含 SQLite），直接用 SQLAlchemy create_all 建表
+
+打印的 DATABASE_URL 都会做 mask_database_url 脱敏（密码变成 ***），不会泄露。
 """
+from __future__ import annotations
+
 import os
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from backend.db import init_database
+from backend.db.config import Settings, mask_database_url
 
 
-def init_mysql_database(database_url: str) -> None:
-    """用 PyMySQL 直接建库（保证 create_all 能连上库）。"""
+def _ensure_uploads_dir(settings: Settings) -> None:
     try:
-        import pymysql  # noqa: F401
-    except ImportError:
-        print("[WARN] PyMySQL 未安装，跳过 MySQL 建库步骤")
-        return
-
-    parsed = _parse_mysql_url(database_url)
-    if not parsed:
-        print("[WARN] DATABASE_URL 不符合 mysql+pymysql:// 格式，跳过 MySQL 建库步骤")
-        return
-    user, password, host, port, database = parsed
-
-    import pymysql
-    conn = pymysql.connect(host=host, port=port, user=user, password=password or "", charset="utf8mb4")
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"CREATE DATABASE IF NOT EXISTS `{database}` "
-                f"DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-            )
-        print(f"[OK] 数据库 {database} 已就绪")
-    finally:
-        conn.close()
-
-
-def _parse_mysql_url(url: str):
-    try:
-        url = url.replace("mysql+pymysql://", "")
-        auth, host_part = url.rsplit("@", 1)
-        if ":" in auth:
-            user, password = auth.split(":", 1)
-        else:
-            user, password = auth, ""
-        hostport, database = host_part.split("/", 1)
-        if "?" in database:
-            database = database.split("?", 1)[0]
-        if ":" in hostport:
-            host, port_str = hostport.split(":", 1)
-            port = int(port_str)
-        else:
-            host, port = hostport, 3306
-        return user, password, host, port, database
+        os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     except Exception:
-        return None
+        pass
 
 
-def init_with_flask():
-    """在 Flask app context 中 create_all。"""
-    # 轻量引入，避免循环依赖
-    from flask import Flask
-    from backend.db.config import Config
-    from backend.db import init_database
-
-    if Config.DATABASE_URL.startswith("mysql"):
-        init_mysql_database(Config.DATABASE_URL)
-
-    app = Flask(__name__)
-    app.config.from_object(Config)
-    init_database(app)
-    print(f"[OK] 表 generation_records 已就绪（DATABASE_URL={Config.DATABASE_URL}）")
+def main() -> None:
+    settings = Settings()
+    masked = mask_database_url(settings.DATABASE_URL or "")
+    _ensure_uploads_dir(settings)
+    engine, session_factory = init_database(settings)
+    try:
+        print(f"[OK] 数据库 {settings.MYSQL_DATABASE if (settings.DATABASE_URL or '').startswith('mysql') else ''} 已就绪")
+        print(f"[OK] 表 generation_records 已就绪（DATABASE_URL={masked}）")
+        print("[DONE] 数据库初始化完成，可重复执行。")
+    finally:
+        try:
+            from sqlalchemy.orm import close_all_sessions
+            close_all_sessions()
+        except Exception:
+            pass
+        try:
+            engine.dispose()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    os.makedirs(os.path.join(os.path.dirname(__file__), "..", "..", "uploads"), exist_ok=True)
-    init_with_flask()
-    print("[DONE] 数据库初始化完成，可重复执行。")
+    main()
