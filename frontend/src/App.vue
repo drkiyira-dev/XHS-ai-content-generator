@@ -13,6 +13,7 @@ import { generate, type GenerationResponse, GenerationError } from './services/g
 type Status = 'idle' | 'loading' | 'success' | 'error'
 const status = ref<Status>('idle')
 const errorMessage = ref('')
+const errorRetryable = ref(false)
 
 // ===== 用户输入 =====
 const form = reactive({
@@ -78,6 +79,7 @@ async function handleImageChange(file: any) {
   // 重置状态
   status.value = 'idle'
   errorMessage.value = ''
+  errorRetryable.value = false
 
   // file.raw 是真正的 File 对象
   const raw = file.raw as File
@@ -128,6 +130,7 @@ function clearImage() {
   }
   status.value = 'idle'
   errorMessage.value = ''
+  errorRetryable.value = false
 }
 
 // ===== 生成结果 =====
@@ -151,6 +154,7 @@ async function handleGenerate() {
   // 2. 进入 loading，禁用按钮
   status.value = 'loading'
   errorMessage.value = ''
+  errorRetryable.value = false
 
   // 3. 组装 FormData
   const formData = new FormData()
@@ -175,8 +179,10 @@ async function handleGenerate() {
     status.value = 'error'
     if (err instanceof GenerationError) {
       errorMessage.value = err.message
+      errorRetryable.value = err.retryable
     } else {
       errorMessage.value = err.message || '生成失败，请重试'
+      errorRetryable.value = false
     }
   }
 }
@@ -271,8 +277,11 @@ function copyAll() {
         class="alert"
       />
 
-      <!-- 重新生成按钮（成功或失败都显示） -->
-      <div v-if="status === 'success' || status === 'error'" class="section">
+      <!-- 成功时允许再次生成；失败时仅对可重试错误显示快捷重试按钮。 -->
+      <div
+        v-if="status === 'success' || (status === 'error' && errorRetryable)"
+        class="section"
+      >
         <el-button
           type="default"
           size="large"
