@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive } from 'vue'
 import { ElMessage } from 'element-plus'
+import type { UploadInstance } from 'element-plus'
 import { DocumentCopy, RefreshRight, Delete } from '@element-plus/icons-vue'
 import { generate, type GenerationResponse, GenerationError } from './services/generation'
 
@@ -23,6 +24,7 @@ const form = reactive({
 // ===== 图片相关 =====
 const imageFile = ref<File | null>(null)
 const imagePreviewUrl = ref('')
+const uploadRef = ref<UploadInstance>()
 
 // 常量配置
 const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
@@ -117,6 +119,8 @@ async function handleImageChange(file: any) {
 
 // 清空图片和结果
 function clearImage() {
+  // 同步清空 el-upload 的内部队列，避免 limit=1 阻止再次选择。
+  uploadRef.value?.clearFiles()
   imageFile.value = null
   if (imagePreviewUrl.value) {
     URL.revokeObjectURL(imagePreviewUrl.value)
@@ -199,6 +203,7 @@ function copyAll() {
         <label class="label">1. 上传图片</label>
         <el-upload
           v-if="!imagePreviewUrl"
+          ref="uploadRef"
           class="upload"
           drag
           action="#"
