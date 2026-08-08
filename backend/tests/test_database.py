@@ -22,7 +22,7 @@ from backend.db import (
     TASK_STATUS_FAILED,
     TASK_STATUS_SUCCESS,
 )
-from backend.core.config import Settings
+from backend.db.config import DatabaseConfig
 from backend.schemas import BusinessException, ErrorCode
 from sqlalchemy.orm import close_all_sessions
 
@@ -31,12 +31,12 @@ class TestDatabaseWorkflow(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="xhs_db_test_")
         self.db_path = Path(self.tmp) / "test.db"
-        self.settings = Settings(
+        self.cfg = DatabaseConfig(
             DATABASE_URL=f"sqlite:///{self.db_path}",
             MYSQL_DATABASE="",
             _env_file=None,
         )
-        self.engine, self.session_factory = init_database(self.settings)
+        self.engine, self.session_factory = init_database(self.cfg)
 
     def tearDown(self):
         close_global_engine_session()
@@ -126,7 +126,7 @@ class TestDatabaseWorkflow(unittest.TestCase):
         except Exception:
             pass
 
-        engine2, sf2 = init_database(self.settings)
+        engine2, sf2 = init_database(self.cfg)
         try:
             with new_session(session_factory=sf2) as db:
                 again = get_record(db, task_id=tid)

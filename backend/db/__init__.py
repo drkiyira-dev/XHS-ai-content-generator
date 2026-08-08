@@ -1,33 +1,28 @@
 """Backend database package（FastAPI + 纯 SQLAlchemy 2.x 同步模式）。
 
-统一配置源：backend.core.config（单一 Settings，禁止第二套）。
+最小化独立数据库配置：backend.db.config.DatabaseConfig（不覆盖 B 侧 backend.core.config.Settings，
+避免 B 本地字段被静默覆盖导致破坏）。B 侧后续只需把 DB 字段追加到 B 真实 Settings 即可替换。
 
-同步 FastAPI 无参数依赖（B 的 async 接口建议后续用 starlette.concurrency.run_in_threadpool / asyncio.to_thread 把同步操作放进线程池执行，
-不要直接把阻塞 Session 放进协程）：
-
+同步 FastAPI 无参数依赖（B 的 async 接口建议用 run_in_threadpool / asyncio.to_thread 放进线程池）：
     from backend.db import get_db, create_pending, mark_success, mark_failed, get_record
     from fastapi import Depends
 
     @router.post("/generations")
-    def create_task(db: Session = Depends(get_db)):
-        r = create_pending(db, image_summary="...", ...)
-        return r.to_dict()
+    def create_task(db: Session = Depends(get_db)): ...
 
-字段映射（B 已与 A 对齐，统一双写）：
-    image_summary  <-> DB image_description
-    body           <-> DB content
-    Repository / 校验 / to_dict 都同时接受两套字段名并在输出中同时包含两套名字。
+字段映射（B 已与 A 对齐，双写）：
+    image_summary <-> DB image_description；body <-> DB content；to_dict 双字段输出。
 
-generation_id（task_id）：
-    只生成一次 uuid.uuid4()（B 的标准 UUID），写库失败时不再重复生成（直接抛异常）。
+generation_id：只生成一次 uuid.uuid4()（标准 UUID4），失败直接抛，不再重新生成。
 
-写库函数异常处理：
-    所有路径（含查询阶段）统一包裹在 try/except 中；
-    遇到 BusinessException 以外的异常先 rollback()，再转换为 DATABASE_ERROR，
-    防止密码 / 原始 SQL / 原始驱动堆栈泄漏到上层响应。
+安全：
+    - 所有写路径（含查询阶段）异常时先 rollback() 再转 DATABASE_ERROR（仅保留类型名）；
+    - DatabaseConfig.MYSQL_PASSWORD 是 SecretStr，repr 不露明文；
+    - 建库名必须通过严格白名单（见 _safe_database_name），禁止 prod/online 等关键词。
 """
 from __future__ import annotations
 
+import re as _re
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
@@ -65,7 +60,13 @@ except ImportError as e:  # pragma: no cover
         "缺少依赖：SQLAlchemy>=2.0.25, PyMySQL>=1.1。请先运行：pip install -r requirements.txt"
     ) from e
 
-from ..core.config import Settings, build_database_url, get_settings, mask_database_url, parse_mysql_url
+from .config import (  # 独立最小 DB 配置，不覆盖 B 的 backend.core.config
+    DatabaseConfig,
+    build_database_url,
+    get_database_config,
+    mask_database_url,
+    parse_mysql_url,
+)
 from ..schemas import BusinessException, ErrorCode
 from ..validation import validate_copy
 
@@ -146,8 +147,17 @@ class GenerationRecord(Base):
 # Engine / Session helpers（同步，无 async driver 依赖）
 # ---------------------------------------------------------------------------
 
-def make_engine(settings: Settings, /) -> Any:
-    url = build_database_url(settings)
+def make_engine(cfg: Any = None, /, *, database_url: Optional[str] = None) -> Any:
+    """同步 engine 构造。两种用法都支持：
+    1) make_engine(cfg)  其中 cfg 可以是 DatabaseConfig 或 B 的真实 Settings（只要有 DATABASE_URL 即可）；
+    2) make_engine(database_url="mysql+pymysql://...") 显式注入 URL。
+    """
+    if database_url:
+        url = database_url
+    elif cfg is not None:
+        url = build_database_url(cfg)
+    else:
+        url = build_database_url(get_database_config())
     if url.startswith("sqlite"):
         return create_engine(url, connect_args={"check_same_thread": False}, future=True)
     return create_engine(
@@ -169,16 +179,30 @@ def make_session_factory(engine: Any, /) -> sessionmaker[Session]:
     )
 
 
+_FORBIDDEN_DB_TOKENS = (
+    "prod",
+    "production",
+    "online",
+    "master",
+    "live",
+    "release",
+    "staging",
+    "uat",
+    "pre",
+    "preprod",
+)
+_DB_NAME_RE = _re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+
 def _safe_database_name(database: str) -> str:
-    """MySQL 数据库名严格白名单：字母数字下划线，字母开头，长度 <=64，且不含 prod/online/production。"""
-    import re as _re
+    """严格白名单：任何不合法的名都返回空字符串，后续逻辑直接拒绝。"""
     if not database or not isinstance(database, str):
         return ""
-    if not _re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", database):
+    if not _DB_NAME_RE.match(database):
         return ""
     low = database.lower()
-    for token in ("prod", "online", "production", "master", "live", "release"):
-        if token in low:
+    for tok in _FORBIDDEN_DB_TOKENS:
+        if tok in low:
             return ""
     return database
 
@@ -188,10 +212,13 @@ def _create_mysql_database_if_missing(url: str) -> None:
     if not parsed:
         return
     user, password, host, port, database = parsed
-    if not _safe_database_name(database):
+    safe_db = _safe_database_name(database)
+    if not safe_db:
+        # 直接抛 DATABASE_ERROR，禁止 CREATE DATABASE（哪怕 IF NOT EXISTS 也不允许）
         raise BusinessException(
             ErrorCode.DATABASE_ERROR,
-            f"非法 MySQL 数据库名：{database!r}（仅允许字母数字下划线，字母开头，<=64 字符，禁止 prod/online/production 等关键词）",
+            f"拒绝在非法或非白名单数据库名 '{database}' 上执行任何建库或初始化操作。"
+            f"数据库名必须严格匹配 ^[A-Za-z][A-Za-z0-9_]{{0,63}}$ 且不包含 prod/production/online/master/live/release/staging/uat/pre/preprod。",
         )
     try:
         import pymysql  # type: ignore
@@ -204,7 +231,7 @@ def _create_mysql_database_if_missing(url: str) -> None:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"CREATE DATABASE IF NOT EXISTS `{database}` "
+                    f"CREATE DATABASE IF NOT EXISTS `{safe_db}` "
                     f"DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
                 )
             conn.commit()
@@ -217,20 +244,29 @@ def _create_mysql_database_if_missing(url: str) -> None:
         raise
     except Exception as e:
         safe_info = (
-            f"创建 MySQL 数据库失败（user={user} host={mask_database_url_part(host)} port={port} db={database}）"
+            f"创建 MySQL 数据库失败（user={mask_database_url_part(user)} host={mask_database_url_part(host)} port={port} db={safe_db}）"
         )
         raise BusinessException(ErrorCode.DATABASE_ERROR, safe_info + f": {type(e).__name__}")
 
 
 def init_database(
-    settings: Optional[Settings] = None, engine: Any = None
+    cfg: Any = None, /, *, engine: Any = None, database_url: Optional[str] = None
 ) -> Tuple[Any, sessionmaker[Session]]:
-    settings = settings or get_settings()
-    url = build_database_url(settings)
+    """初始化数据库（同步）。支持三种：
+    1) init_database() -> 自动 get_database_config()；
+    2) init_database(B_settings) -> B_settings 只要有 DATABASE_URL 就能用；
+    3) init_database(database_url="mysql+pymysql://...") -> 显式注入 URL。
+    """
+    if database_url:
+        url = database_url
+    elif cfg is not None:
+        url = build_database_url(cfg)
+    else:
+        url = build_database_url(get_database_config())
     if url.startswith("mysql"):
         _create_mysql_database_if_missing(url)
     if engine is None:
-        engine = make_engine(settings)
+        engine = make_engine(database_url=url)
     try:
         Base.metadata.create_all(engine)
     except Exception as e:
@@ -254,7 +290,7 @@ def get_session_factory() -> sessionmaker[Session]:
     """Depends(get_db) 内部使用：懒初始化一次全局 session_factory。"""
     global _global_engine, _global_session_factory
     if _global_session_factory is None:
-        _global_engine, sf = init_database(get_settings())
+        _global_engine, sf = init_database()
         _global_session_factory = sf
     assert _global_session_factory is not None
     return _global_session_factory
@@ -265,10 +301,17 @@ def set_global_session_factory(sf: sessionmaker[Session], /) -> None:
     _global_session_factory = sf
 
 
-def init_database_global(settings: Optional[Settings] = None, engine: Any = None) -> sessionmaker[Session]:
+def init_database_global(
+    cfg: Any = None, /, *, engine: Any = None, database_url: Optional[str] = None
+) -> sessionmaker[Session]:
+    """全局一次性初始化（支持 DatabaseConfig / B 的真实 Settings / 直接 database_url）。"""
     global _global_engine, _global_session_factory
-    settings = settings or get_settings()
-    _global_engine, sf = init_database(settings, engine)
+    if database_url:
+        _global_engine, sf = init_database(engine=engine, database_url=database_url)
+    elif cfg is not None:
+        _global_engine, sf = init_database(cfg, engine=engine)
+    else:
+        _global_engine, sf = init_database(get_database_config(), engine=engine)
     _global_session_factory = sf
     return sf
 

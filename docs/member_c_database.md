@@ -35,12 +35,17 @@
 [GenerationRecord(Base, DeclarativeBase)] ── SQLAlchemy 2.x ORM ──► MySQL 8.x / SQLite
         │
         ▼
-[Settings (Pydantic v2 BaseSettings)]
-   优先 DATABASE_URL；否则由 MYSQL_HOST/PORT/DATABASE/USER/PASSWORD 拼接
-   所有日志/print 输出：mask_database_url(url) 对密码做 *** 脱敏，禁止打印明文密码
+[独立 DatabaseConfig (backend.db.config, Pydantic v2 SecretStr password) — 不覆盖 B 本地 backend.core.config.Settings]
+   - 优先显式 database_url 注入（B 的真实 settings 只要有 DATABASE_URL 属性即可直接 init_database(B_settings) 或 init_database(database_url=B_settings.DATABASE_URL)）；
+   - 否则由 MYSQL_HOST/PORT/DATABASE/USER/PASSWORD 组合（SQLAlchemy URL.create() 自动转义特殊字符密码）；
+   - 所有日志/print 输出：mask_database_url(url) 保守脱敏 → parse 不确定直接输出固定安全占位符 <invalid-database-url>，绝不回原连接串。
 ```
 
+> **为什么 C 这里不直接改 backend.core.config？**（B 侧分支尚未发布到 GitHub，C 无法看到 B 必需的 `siliconflow_api_key / vision_model_name / ocr_model_name / cors_origins / resolved_upload_dir / max_image_size_mb / max_image_pixels / model_max_image_edge` 等真实字段，重写会覆盖/静默忽略 B 的本地配置导致破坏。后续由 B 在其真实分支把 DATABASE_URL + MYSQL_* 追加到 B 的 `backend.core.config.Settings` 即可无缝替换；C 层 `init_database()` 三种签名（空参用独立 DatabaseConfig / 传 cfg 对象 / 传 database_url）都已留好兼容位。
+
 成员 B 不再**需要写 SQL**，也**不再需要 Flask app context**。所有 repository 函数第一个参数都是显式 `Session`（FastAPI 的 `Depends(get_db)` 注入即可）。为了方便脚本/单测/CLI 调用，C 层还提供了一组带 `_g` 后缀的「便捷版」（自动使用全局 session_factory，无需传 Session）。
+
+> **关于 FastAPI 异步路由的同步阻塞 Session 调用建议：**C 本版已彻底删除异步 asyncio SQLAlchemy 栈（避免 SQLite 同步驱动不兼容、aiomysql 缺依赖、Depends(async_get_db) 直接报错等问题）。若 B 的路由是 `async def ...`，请把同步 Repository 调用放进线程池：`from starlette.concurrency import run_in_threadpool` → `await run_in_threadpool(create_pending, db, image_summary=...)`，或 `await asyncio.to_thread(create_pending, db, ...)`。
 
 ---
 
@@ -51,7 +56,7 @@
 | 字段                | 类型         | 索引/约束            | 说明                                                                 |
 | ------------------- | ------------ | -------------------- | -------------------------------------------------------------------- |
 | `id`                | INT          | PK AUTO_INCREMENT    | 内部自增主键                                                         |
-| `task_id` (对外 = `generation_id`) | VARCHAR(64)  | UNIQUE / idx_task_id | **对外暴露的 generation_id**，格式 `gen_<hex24>`，UUID4 熵 + DB UNIQUE 双重唯一 |
+| `task_id` (对外 = `generation_id`) | VARCHAR(64)  | UNIQUE / idx_task_id | **对外暴露的 generation_id**，标准 `str(uuid.uuid4())`（带 4 个 `-`），在 `create_pending` 入口只生成一次；失败不重新生成。 |
 | `status`            | VARCHAR(16)  | idx_status           | `pending` / `success` / `failed`                                     |
 | `image_path`        | VARCHAR(512) |                      | 上传图片在本地/对象存储的路径                                       |
 | `image_description` | TEXT         |                      | 识图结果 / 图片描述（应用层+mark_success 内强制非空）               |
@@ -86,12 +91,24 @@ python backend/db/init_db.py
 ```
 逻辑：`DATABASE_URL.startswith("mysql")` 时，PyMySQL 先 `CREATE DATABASE IF NOT EXISTS ... utf8mb4`，再 `Base.metadata.create_all(engine)` 建表；SQLite 直接 `create_all`。
 
-源码：[backend/db/init_db.py](file:///Users/zza/Documents/trae_projects/xhs/backend/db/init_db.py#L1-L55)（依赖 [Settings](file:///Users/zza/Documents/trae_projects/xhs/backend/db/config.py#L42-L74) 和 [init_database](file:///Users/zza/Documents/trae_projects/xhs/backend/db/__init__.py#L233-L245)）
+源码：[backend/db/init_db.py](file:///Users/zza/Documents/trae_projects/xhs/backend/db/init_db.py#L1-L55)（依赖 [独立 DatabaseConfig](file:///Users/zza/Documents/trae_projects/xhs/backend/db/config.py) 和 [init_database](file:///Users/zza/Documents/trae_projects/xhs/backend/db/__init__.py#L252-L278)）
 
 ### 方式 B（DBA / 纯 SQL 执行）：
 ```bash
 mysql -h$MYSQL_HOST -P$MYSQL_PORT -u$MYSQL_USER -p < schema/migration/001_init.sql
 ```
+
+---
+
+## 2.6 安全 & 保守策略总览（C 侧强制启用）
+
+| 策略 | 范围 | 失败时行为 |
+|------|------|------------|
+| **URL 脱敏**：`mask_database_url` | 所有日志 / print / 异常字符串 | parse 不确定或畸形 URL（如端口 `notaport`、密码段位置不确定、SA parse 异常）一律返回固定安全占位符 `<invalid-database-url>`，绝不保留原连接串结构，绝不含原密码片段；SQLite 路径（无密码段）可正常显示，便于调试。 |
+| **双开关 MySQL 自测**：`MYSQL_TEST_URL` + `MYSQL_TEST_CONFIRM=YES_I_KNOW_IT_IS_A_TEST_DB` | `run_selfcheck.py` 的真实 MySQL 模式 | 在**任何 connect / CREATE DATABASE / CREATE TABLE / 写入测试记录 / DROP DATABASE** 之前先跑双开关校验 + 严格测试库名白名单；缺少任一项直接 `SystemExit` 退出，零副作用。 |
+| **测试库名白名单** | 上面的 MySQL 双开关逻辑 + `_create_mysql_database_if_missing` 初始化入口 | 严格 `^[A-Za-z][A-Za-z0-9_]{0,63}$` 字符集；子串包含 `prod/production/online/master/live/release/staging/uat/pre/preprod` 一律拒绝；仅允许：精确 `xhs_test`、前缀 `xhs_test_` / `test_`、后缀 `*_test`（且后缀模式下 head 段不得再含 `test`，避免 `production_test`/`test_prod`）。 |
+| **SecretStr 密码字段** | `DatabaseConfig.MYSQL_PASSWORD` + `DatabaseConfig.DATABASE_URL` | Pydantic `repr=False`，`repr(cfg)` / `str(cfg)` / `print(cfg)` 永远不会输出明文 URL 或明文密码；只有 `cfg.MYSQL_PASSWORD.get_secret_value()` 内部调用才能拿到。 |
+| **异常再包装 + rollback 优先** | 所有 Repository 函数（create/mark_success/mark_failed/get_record/list_records）+ FastAPI Depends | 任何非 `BusinessException` 的 DB 异常先 `session.rollback()`，再统一转成 `DATABASE_ERROR`（只保留 `type(e).__name__`，不泄漏原始 SQL / 原始 URL / 驱动堆栈 / 密码）。 |
 
 ---
 
@@ -115,13 +132,14 @@ mysql -h$MYSQL_HOST -P$MYSQL_PORT -u$MYSQL_USER -p < schema/migration/001_init.s
 
 | 变量名                | 说明                                                                                                                              |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `MYSQL_TEST_URL`      | 若设置：run_selfcheck.py 会走真实 MySQL 成功/失败写入验证；自动 CREATE DATABASE IF NOT EXISTS；默认值 **不设置**，走临时 SQLite      |
-| `MYSQL_TEST_CLEANUP`  | 仅当设置了 `MYSQL_TEST_URL` 且值为 `1`：测试结束自动 `DROP DATABASE`；默认 **0（不删）** 便于人工用 SELECT 验收真实写入             |
+| `MYSQL_TEST_URL`      | 若设置：run_selfcheck.py 会尝试真实 MySQL；必须配合第二个确认开关才会真正连接（双开关）。默认**不设置**，走临时 SQLite               |
+| `MYSQL_TEST_CONFIRM`  | **必须设置为固定字符串** `YES_I_KNOW_IT_IS_A_TEST_DB`，作为第二重确认；缺失或值不一致：测试脚本在任何连接前直接 SystemExit。       |
+| `MYSQL_TEST_CLEANUP`  | 仅当上面两个变量都已通过 + 值为 `1`：测试结束自动 `DROP DATABASE`；默认 **0（不删）** 便于人工 SELECT 验收真实写入                 |
 
-Settings 源码（Pydantic v2 `BaseSettings` + `SettingsConfigDict`）：
-[backend/db/config.py → Settings](file:///Users/zza/Documents/trae_projects/xhs/backend/db/config.py#L42-L139)
-密码脱敏工具函数：
-[mask_database_url(url)](file:///Users/zza/Documents/trae_projects/xhs/backend/db/config.py#L91-L104)
+独立 DatabaseConfig 源码（Pydantic v2 BaseSettings + SecretStr password + repr=False 防泄漏）：
+[backend/db/config.py → DatabaseConfig](file:///Users/zza/Documents/trae_projects/xhs/backend/db/config.py#L64-L110)
+保守脱敏工具函数（parse 不确定直接占位符，绝不回原 URL）：
+[mask_database_url(url)](file:///Users/zza/Documents/trae_projects/xhs/backend/db/config.py#L136-L175)
 
 ---
 
@@ -132,13 +150,17 @@ Settings 源码（Pydantic v2 `BaseSettings` + `SettingsConfigDict`）：
 ```python
 # backend/main.py（成员 B 的 FastAPI 入口）
 from fastapi import FastAPI
-from backend.db import init_database_global, get_db
-from backend.db.config import get_settings
+from backend.db import init_database_global
 
-settings = get_settings()          # Pydantic v2 Settings，单例
-init_database_global(settings)     # 全局初始化一次：建库(MySQL) + 建表 + 注册全局 session_factory
+# 方案 A（推荐）：B 的真实 Settings 有 DATABASE_URL 属性，直接传
+init_database_global(
+    database_url=backend.core.config.settings.DATABASE_URL
+)
+# 方案 B（若 B 的真实 Settings 已追加了 MYSQL_HOST/PORT/... 等字段）：
+#   from backend.db.config import DatabaseConfig  # 不要覆盖 B 原 backend.core.config
+#   或直接 init_database_global(B_settings)，只要 B_settings 有 DATABASE_URL 即可。
 
-app = FastAPI(title="XHS Content Generator", version="0.1.0")
+app = FastAPI(title="XHS Content Generator", version="0.2.0")
 
 # 以后所有路由的 db 参数，统一用 Depends(get_db) 注入 Session
 ```
