@@ -17,6 +17,10 @@ from backend.services.model import (
     QwenGenerationService,
     SiliconFlowClient,
 )
+from backend.services.persistence import (
+    GenerationPersistence,
+    NoOpGenerationPersistence,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -26,6 +30,7 @@ def create_app(
     settings: Settings,
     *,
     model_service: GenerationModelService | None = None,
+    generation_persistence: GenerationPersistence | None = None,
 ) -> FastAPI:
     """Build an application with explicit, testable runtime settings."""
     owned_model_service: OCRAugmentedGenerationService | None = None
@@ -54,6 +59,11 @@ def create_app(
     )
     application.state.settings = settings
     application.state.model_service = runtime_model_service
+    application.state.generation_persistence = (
+        generation_persistence
+        if generation_persistence is not None
+        else NoOpGenerationPersistence()
+    )
     register_exception_handlers(application)
 
     @application.middleware("http")

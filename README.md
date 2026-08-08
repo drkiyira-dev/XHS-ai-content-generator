@@ -146,9 +146,11 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/generations' \
 | 502 | `MODEL_FAILED` | 模型服务、权限、限流或上游响应失败 | 视上游状态而定 |
 | 502 | `MODEL_OUTPUT_INVALID` | 模型输出无法归一化，或未通过事实安全校验 | 是 |
 | 504 | `MODEL_TIMEOUT` | OCR 与 Qwen 的总处理时间超限 | 是 |
+| 500 | `DATABASE_ERROR` | 生成结果暂时无法保存 | 是 |
 | 500 | `INTERNAL_ERROR` | 未分类的服务器内部错误 | 否 |
 
-成员 C 的持久化接口接入后，还需要补充 `DATABASE_ERROR`。
+B 侧已经预留 `DATABASE_ERROR`；当前仍使用 No-op 持久化实现，需在成员 C
+适配器接入后完成真实 MySQL 失败验证。
 
 ## 处理流程
 
@@ -156,10 +158,12 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/generations' \
 上传图片
   → 文件类型、魔数、体积、解码和尺寸校验
   → EXIF、透明通道、RGB 与缩放预处理
+  → create_pending（当前为 No-op）
   → PaddleOCR-VL（失败时安全降级）
   → Qwen3-VL 图片理解与文案生成
   → JSON 解析、字段归一化与有限重试
   → 事实安全校验
+  → mark_success / mark_failed（当前为 No-op）
   → 返回固定 API 响应
 ```
 
@@ -187,7 +191,7 @@ python -m pytest
 当前版本只完成成员 B 的独立生成后端。以下内容仍待团队联调：
 
 - 接入成员 C 提供的 `create_pending`、`validate_copy`、`mark_success`、`mark_failed` 持久化接口。
-- 为数据库失败补充统一的 `DATABASE_ERROR`。
+- 使用真实 MySQL 验证 `DATABASE_ERROR`、事务回滚和状态一致性。
 - 由成员 A 接入真实上传页、Loading、结果展示和复制按钮。
 - 完成商品、食物、风景、带文字图片及异常路径的团队验收记录。
 - 通过 Pull Request 将 `feat/b-generation-api` 合并到 `develop`；禁止直接推送 `main`。

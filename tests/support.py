@@ -11,6 +11,7 @@ from backend.app import create_app
 from backend.core.config import Settings
 from backend.services.image import ProcessedImage
 from backend.services.model import GeneratedCopy, GenerationModelService
+from backend.services.persistence import GenerationPersistence
 
 
 class StubModelService:
@@ -39,6 +40,7 @@ class StubModelService:
 def build_test_app(
     *,
     model_service: GenerationModelService | None = None,
+    generation_persistence: GenerationPersistence | None = None,
     **overrides: Any,
 ) -> FastAPI:
     """Create the app without reading a developer's real .env file."""
@@ -54,6 +56,7 @@ def build_test_app(
     return create_app(
         settings,
         model_service=model_service or StubModelService(),
+        generation_persistence=generation_persistence,
     )
 
 
