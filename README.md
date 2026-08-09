@@ -16,7 +16,7 @@
 
 成员 C 的数据库核心已经通过 B 的异步适配器接入应用生命周期。MySQL 持久化默认
 关闭，未启用时继续使用 No-op；显式启用后若启动检查失败，应用会终止启动，不会假装
-写库成功。真实 MySQL 验收完成前，不应宣称数据库联调已经完成。
+写库成功。B+C 持久化链路已在本机 MySQL 9.6 专用测试库完成真实验收。
 
 ## 环境要求
 
@@ -104,6 +104,10 @@ DATABASE_URL=mysql+pymysql://xhs_app:在此填写密码@127.0.0.1:3306/xhs_ai_te
 地址。启动时会进行一次只读连通性和表存在性检查；检查失败会安全终止启动，不会静默
 退回 No-op。Engine 固定隐藏 SQL 参数，并设置连接、读写和连接池超时。
 
+本机专用测试库已经验证：API 成功写入、模型失败状态写入、重复 ID 回滚、同一 pending
+记录的并发终态竞争、Engine 释放后的重新连接与数据读取，以及本轮测试记录的精确清理。
+应用用户仅拥有该测试库的 `SELECT`、`INSERT`、`UPDATE`、`DELETE` 权限。
+
 ## 启动后端
 
 激活虚拟环境后运行：
@@ -187,8 +191,8 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/generations' \
 | 500 | `DATABASE_ERROR` | 生成结果暂时无法保存 | 是 |
 | 500 | `INTERNAL_ERROR` | 未分类的服务器内部错误 | 否 |
 
-B 侧已经预留 `DATABASE_ERROR`，并已接入成员 C 的适配器；仍需在专用测试库完成真实
-MySQL 成功、失败和数据库中断验证。
+B 侧的 `DATABASE_ERROR` 与成员 C 的适配器已经接通。真实 MySQL 测试确认成功和失败
+记录使用同一个 `generation_id`，重复 ID 会安全返回 `DATABASE_ERROR` 且不覆盖原记录。
 
 ## 处理流程
 
@@ -224,6 +228,16 @@ python -m pytest
 
 真实 API 测试会产生模型调用费用；自动化测试默认使用 Mock，不会调用硅基流动。
 
+真实 MySQL 测试默认跳过，避免 CI 或普通本地测试误写数据库。它只允许连接文档约定的
+`xhs_app@127.0.0.1/xhs_ai_test`，并且需要显式确认变量：
+
+```bash
+XHS_MYSQL_LIVE_TEST_CONFIRM=YES_USE_XHS_AI_TEST \
+  python -m pytest tests/test_mysql_live.py
+```
+
+该测试使用三个随机 UUID，验证完成后只删除这三个 ID，不删除数据库、表或其他记录。
+
 ## GitHub Actions 自动检查
 
 仓库的 `CI` workflow 会在以下情况自动运行：
@@ -244,8 +258,6 @@ CI 包含两个互相独立的任务：
 
 当前版本只完成成员 B 的独立生成后端。以下内容仍待团队联调：
 
-- 使用真实 MySQL 验证同一 `generation_id`、`DATABASE_ERROR`、事务回滚、状态一致性和
-  服务重启后的数据保留；当前自动化测试只验证了 SQLite 与运行时装配。
 - 由成员 A 接入真实上传页、Loading、结果展示和复制按钮。
 - 完成商品、食物、风景、带文字图片及异常路径的团队验收记录。
 - 通过 Pull Request 将 `feat/b-generation-api` 合并到 `develop`；禁止直接推送 `main`。

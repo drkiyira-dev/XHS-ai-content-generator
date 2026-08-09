@@ -33,3 +33,6 @@ include = ["backend*"]
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "mysql_live: opt-in tests that read the local .env and write isolated MySQL test records",
+]
