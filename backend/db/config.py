@@ -117,17 +117,30 @@ def get_database_config() -> DatabaseConfig:
 
 def build_database_url(cfg: DatabaseConfig) -> str:
     """用 SQLAlchemy URL.create() 构造，保证密码含 @/%/: 时正确 % 转义。"""
-    if getattr(cfg, "DATABASE_URL", None):
-        return str(cfg.DATABASE_URL)
+    url_from_attr = getattr(cfg, "DATABASE_URL", None)
+    if url_from_attr:
+        return str(url_from_attr)
     # 注意：SecretStr 的 get_secret_value() 在这里只用于构造本地 URL，绝不打印
-    pwd = cfg.MYSQL_PASSWORD.get_secret_value() if isinstance(cfg.MYSQL_PASSWORD, SecretStr) else str(cfg.MYSQL_PASSWORD or "")
+    pwd_obj = getattr(cfg, "MYSQL_PASSWORD", None)
+    user = getattr(cfg, "MYSQL_USER", None) or None
+    host = getattr(cfg, "MYSQL_HOST", None) or None
+    port_raw = getattr(cfg, "MYSQL_PORT", None)
+    database = getattr(cfg, "MYSQL_DATABASE", None) or None
+    try:
+        port = int(port_raw or 3306)
+    except Exception:
+        port = 3306
+    if isinstance(pwd_obj, SecretStr):
+        pwd = pwd_obj.get_secret_value()
+    else:
+        pwd = "" if pwd_obj is None else str(pwd_obj)
     sa_url = _SA_URL.create(
         drivername="mysql+pymysql",
-        username=cfg.MYSQL_USER or None,
+        username=user,
         password=pwd or None,
-        host=cfg.MYSQL_HOST or None,
-        port=int(cfg.MYSQL_PORT or 3306),
-        database=cfg.MYSQL_DATABASE or None,
+        host=host,
+        port=port,
+        database=database,
         query={"charset": "utf8mb4"},
     )
     return sa_url.render_as_string(hide_password=False)

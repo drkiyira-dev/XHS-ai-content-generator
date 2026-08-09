@@ -23,7 +23,6 @@ generation_id：只生成一次 uuid.uuid4()（标准 UUID4），失败直接抛
 from __future__ import annotations
 
 import re as _re
-import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from typing import (
@@ -126,7 +125,6 @@ class GenerationRecord(Base):
         return {
             "id": self.id,
             "generation_id": self.task_id,
-            "task_id": self.task_id,
             "status": self.status,
             "image_path": self.image_path,
             "image_description": self.image_description,
@@ -424,11 +422,6 @@ def mask_database_url_part(host_or_user: Any) -> str:
 # Repository API（纯同步）
 # ---------------------------------------------------------------------------
 
-def _generate_task_id() -> str:
-    """B 的标准 UUID：只生成一次 uuid.uuid4()，写入 DB 前不再重新生成。"""
-    return str(uuid.uuid4())
-
-
 def _resolve_image_description(
     *, image_description: Any = None, image_summary: Any = None
 ) -> Optional[str]:
@@ -464,16 +457,20 @@ def create_pending(
     db: Session,
     /,
     *,
+    generation_id: str,
     image_path: Optional[str] = None,
     user_input: Optional[str] = None,
     image_description: Optional[str] = None,
     image_summary: Optional[str] = None,
 ) -> GenerationRecord:
-    """创建 pending 任务。接受 image_summary（A 对齐字段）或 image_description。
+    """创建 pending 任务。必须接收 B 传入的 generation_id；内部映射到 task_id 字段。
 
-    task_id 只生成一次 uuid.uuid4()（标准 UUID4），写库失败不再重新生成，直接抛异常。
+    - 绝不自行生成任何 UUID / task_* / gen_* ID；
+    - generation_id 必须是 B 已生成的字符串（通常为 str(uuid.uuid4())，具体格式由 B 决定）。
     """
-    task_id = _generate_task_id()  # 只生成一次
+    if not generation_id or not isinstance(generation_id, str):
+        raise BusinessException(ErrorCode.VALIDATION_ERROR, "create_pending 必须接收 B 传入的 generation_id")
+    task_id = generation_id
     img_desc = _resolve_image_description(image_description=image_description, image_summary=image_summary)
     record = GenerationRecord(
         task_id=task_id,
@@ -532,7 +529,7 @@ def mark_success(
     db: Session,
     /,
     *,
-    task_id: str,
+    generation_id: str,
     title: str,
     content: Optional[str] = None,
     tags: Iterable[str],
@@ -542,8 +539,10 @@ def mark_success(
 ) -> GenerationRecord:
     """标记 success。支持 image_summary / body 别名。内部强制 validate_copy，不合规 rollback。
 
-    查询 / 校验 / flush 全路径都做了 rollback + DATABASE_ERROR 转换，防止事务泄漏和原始错误外泄。
+    - 必须使用 B 提供的同一个 generation_id；
+    - 查询 / 校验 / flush 全路径都做了 rollback + DATABASE_ERROR 转换，防止事务泄漏和原始错误外泄。
     """
+    task_id = generation_id
     try:
         record = _get_by_task_id_or_raise(db, task_id)
         desc_arg = _resolve_image_description(image_description=image_description, image_summary=image_summary)
@@ -598,13 +597,17 @@ def mark_failed(
     db: Session,
     /,
     *,
-    task_id: str,
+    generation_id: str,
     error_code: str,
     error_message: str,
     image_description: Optional[str] = None,
     image_summary: Optional[str] = None,
 ) -> GenerationRecord:
-    """标记 failed。接受 image_summary 别名。查询 / flush 全路径做 rollback + DATABASE_ERROR 转换。"""
+    """标记 failed。接受 image_summary 别名。必须使用 B 提供的同一个 generation_id。
+
+    查询 / flush 全路径做 rollback + DATABASE_ERROR 转换。
+    """
+    task_id = generation_id
     try:
         record = _get_by_task_id_or_raise(db, task_id)
         record.status = TASK_STATUS_FAILED
@@ -636,7 +639,8 @@ def mark_failed(
         )
 
 
-def get_record(db: Session, /, *, task_id: str) -> Optional[GenerationRecord]:
+def get_record(db: Session, /, *, generation_id: str) -> Optional[GenerationRecord]:
+    task_id = generation_id
     from sqlalchemy import select as _sa_select
     try:
         return db.execute(

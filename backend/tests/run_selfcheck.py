@@ -190,22 +190,29 @@ def _mysql_cleanup(cfg: DatabaseConfig) -> None:
         print(f"[WARN] MySQL 清理失败（不影响结果）：{type(e).__name__}")
 
 
+DEMO_GEN_ID = "gen-demo0001-1234-5678-9abc-def012345678"
+DEMO_GEN_ID_2 = "gen-demo0002-1111-2222-3333-444455556666"
+
+
 def _workflow_5_steps(cfg: DatabaseConfig) -> None:
     # cfg 也可以是 B 的真实 settings（只要有 DATABASE_URL 属性，init_database 就能用）
     engine, session_factory = init_database(cfg)
     try:
-        print("[1/5] create_pending...")
+        print("[1/5] create_pending（必须使用 B 传入的 generation_id，不自行生成）...")
+        tid = DEMO_GEN_ID
         with new_session(session_factory=session_factory) as s:
             r = create_pending(
                 s,
+                generation_id=tid,
                 image_path="/tmp/a.jpg",
                 user_input="夏日穿搭",
                 image_summary="阳光下的连衣裙",
             )
-            assert r.task_id.count("-") == 4, f"标准 UUID4 应含 4 个 '-', got {r.task_id}"
+            assert r.task_id == tid, f"内部 task_id 必须等于 B 传入的 generation_id, got {r.task_id}"
+            assert r.to_dict()["generation_id"] == tid
+            assert "task_id" not in r.to_dict(), "对外输出禁止同时保留 task_id 别名"
             assert r.status == "pending"
-            tid = r.task_id
-        print(f"    OK generation_id = {tid} (标准 UUID4)")
+        print(f"    OK generation_id = {tid}（B 传入字符串，未被修改或重新生成）")
 
         print("[2/5] validate_copy/validate_generation_result + mark_success 内部校验不写脏数据")
 
@@ -247,12 +254,13 @@ def _workflow_5_steps(cfg: DatabaseConfig) -> None:
             assert "image_summary" in (e2.data or {}), f"应含 image_summary 错误，实际 {e2.data}"
         print("    OK validate_generation_result: image_summary 空拦截")
 
+        tmp_gid = "gen-tmp-9f9f9f9f-0000-1111-2222-333344445555"
         with new_session(session_factory=session_factory) as s:
-            r = create_pending(s, image_path="/tmp/bad.jpg")
+            create_pending(s, generation_id=tmp_gid, image_path="/tmp/bad.jpg")
             try:
                 mark_success(
                     s,
-                    task_id=r.task_id,
+                    generation_id=tmp_gid,
                     title="这个标题绝对超过二十个字你数一下看看对不对哦哦",
                     body="正文",
                     tags=["a", "b", "c", "d"],
@@ -260,15 +268,15 @@ def _workflow_5_steps(cfg: DatabaseConfig) -> None:
                 )
             except BusinessException as ee:
                 assert ee.code == ErrorCode.VALIDATION_ERROR
-                again = get_record(s, task_id=r.task_id)
+                again = get_record(s, generation_id=tmp_gid)
                 assert again and again.status == "pending", "mark_success 不合规不应写脏数据"
         print("    OK mark_success 内部再次校验，不合规不写库")
 
-        print("[3/5] mark_success（image_summary/body 字段别名 → DB image_description/content）")
+        print("[3/5] mark_success（image_summary/body 字段别名 → DB image_description/content；同一 generation_id）")
         with new_session(session_factory=session_factory) as s:
             r2 = mark_success(
                 s,
-                task_id=tid,
+                generation_id=tid,
                 title="夏日穿搭分享",
                 body="今天分享三套夏日 look，显瘦又出片！",
                 tags=["夏日", "穿搭", "#穿搭", "OOTD", "夏日", "每日"],
@@ -286,24 +294,26 @@ def _workflow_5_steps(cfg: DatabaseConfig) -> None:
             assert all(t.startswith("#") for t in (r2.tags or []))
         print("    OK tags =", r2.tags)
 
-        print("[4/5] mark_failed 带错误码落库")
+        print("[4/5] mark_failed 带错误码落库（同一 generation_id）")
+        failed_tid = DEMO_GEN_ID_2
         with new_session(session_factory=session_factory) as s:
-            r3 = create_pending(s, image_path="/tmp/bad.png")
-            failed_tid = r3.task_id
+            create_pending(s, generation_id=failed_tid, image_path="/tmp/bad.png")
             f = mark_failed(
                 s,
-                task_id=r3.task_id,
+                generation_id=failed_tid,
                 error_code=ErrorCode.IMAGE_PROCESS_ERROR,
-                error_message="图片损坏",
+                error_message="图片处理失败",
                 image_summary="坏图描述",
             )
+            assert f.to_dict()["generation_id"] == failed_tid
             assert f.status == TASK_STATUS_FAILED
             assert f.error_code == ErrorCode.IMAGE_PROCESS_ERROR
-            assert f.error_message == "图片损坏"
+            # 七：错误落库只存 error_code + 安全固定文案，禁止写第三方异常原文
+            assert f.error_message == "图片处理失败"
             assert f.image_description == "坏图描述"
-        print("    OK error_code/error_message 已保存；image_summary→image_description 生效")
+        print("    OK error_code + 固定错误文案已保存；generation_id 与 pending 完全相同")
 
-        print("[5/5] 服务重启后记录仍存在")
+        print("[5/5] 服务重启后记录仍存在（按 generation_id 查询）")
         try:
             close_all_sessions()
         except Exception:
@@ -315,9 +325,9 @@ def _workflow_5_steps(cfg: DatabaseConfig) -> None:
         engine2, sf2 = init_database(cfg)
         try:
             with new_session(session_factory=sf2) as s:
-                g = get_record(s, task_id=tid)
+                g = get_record(s, generation_id=tid)
                 assert g and g.status == TASK_STATUS_SUCCESS and g.user_input == "夏日穿搭"
-                g2 = get_record(s, task_id=failed_tid)
+                g2 = get_record(s, generation_id=failed_tid)
                 assert g2 and g2.status == TASK_STATUS_FAILED
                 cnt = len(list_records(s))
                 assert cnt >= 2
