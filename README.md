@@ -139,6 +139,7 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/generations' \
 | HTTP 状态 | 错误码 | 说明 | 可重试 |
 | --- | --- | --- | --- |
 | 400 | `IMAGE_REQUIRED` | 未上传图片或文件为空 | 否 |
+| 400 | `FORM_FIELD_TOO_LARGE` | 可选文本字段超过表单解析上限 | 否 |
 | 413 | `IMAGE_TOO_LARGE` | 图片超过当前配置的体积限制 | 否 |
 | 415 | `UNSUPPORTED_IMAGE_TYPE` | 格式不支持，或 MIME、魔数、真实格式不一致 | 否 |
 | 422 | `IMAGE_DECODE_FAILED` | 图片损坏或无法解码 | 否 |

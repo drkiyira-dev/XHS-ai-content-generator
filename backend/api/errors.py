@@ -1,9 +1,14 @@
 """Stable public API error responses."""
 
 from fastapi import FastAPI, Request
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.formparsers import MultiPartException
 from typing_extensions import TypedDict
 
 
@@ -56,6 +61,23 @@ def register_exception_handlers(application: FastAPI) -> None:
     async def handle_api_error(_request: Request, error: APIError) -> JSONResponse:
         return JSONResponse(status_code=error.status_code, content=error.payload())
 
+    @application.exception_handler(StarletteHTTPException)
+    async def handle_http_exception(
+        request: Request,
+        error: StarletteHTTPException,
+    ) -> JSONResponse:
+        if _is_generation_form_field_too_large(request, error):
+            api_error = APIError(
+                code="FORM_FIELD_TOO_LARGE",
+                message="表单文本字段过大，请缩短后重试。",
+                status_code=400,
+            )
+            return JSONResponse(
+                status_code=api_error.status_code,
+                content=api_error.payload(),
+            )
+        return await http_exception_handler(request, error)
+
     @application.exception_handler(RequestValidationError)
     async def handle_request_validation(
         request: Request,
@@ -106,3 +128,24 @@ def register_exception_handlers(application: FastAPI) -> None:
             status_code=api_error.status_code,
             content=api_error.payload(),
         )
+
+
+def _is_generation_form_field_too_large(
+    request: Request,
+    error: StarletteHTTPException,
+) -> bool:
+    """Recognize only parser size failures on the generation endpoint."""
+    parser_error = error.__context__
+    if not isinstance(parser_error, MultiPartException):
+        return False
+    detail = parser_error.message
+    return (
+        request.method == "POST"
+        and request.url.path == "/api/v1/generations"
+        and error.status_code == 400
+        and isinstance(detail, str)
+        and detail.endswith("KB.")
+        and detail.startswith(
+            ("Part exceeded maximum size of ", "Field exceeded maximum size of ")
+        )
+    )

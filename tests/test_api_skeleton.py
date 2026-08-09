@@ -4,7 +4,10 @@ import asyncio
 from datetime import datetime
 from uuid import UUID
 
-from tests.support import make_image_bytes, send_request
+import pytest
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from tests.support import build_test_app, make_image_bytes, send_request
 
 
 def test_generation_endpoint_accepts_frozen_multipart_contract() -> None:
@@ -39,8 +42,6 @@ def test_generation_endpoint_accepts_frozen_multipart_contract() -> None:
 
 
 def test_openapi_marks_image_as_a_binary_multipart_file() -> None:
-    from tests.support import build_test_app
-
     schema = build_test_app().openapi()
     operation = schema["paths"]["/api/v1/generations"]["post"]
     multipart_schema = operation["requestBody"]["content"]["multipart/form-data"]
@@ -93,6 +94,96 @@ def test_optional_form_fields_can_all_be_omitted() -> None:
     )
 
     assert response.status_code == 200
+
+
+@pytest.mark.parametrize("field_name", ["product_name", "target_audience", "tone"])
+def test_oversized_optional_form_field_uses_frozen_error_envelope(
+    field_name: str,
+) -> None:
+    response = asyncio.run(
+        send_request(
+            "POST",
+            "/api/v1/generations",
+            files={"image": ("sample.png", make_image_bytes(), "image/png")},
+            data={field_name: "x" * (1024 * 1024 + 1)},
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "FORM_FIELD_TOO_LARGE",
+            "message": "表单文本字段过大，请缩短后重试。",
+            "retryable": False,
+        }
+    }
+    assert "detail" not in response.json()
+
+
+def test_optional_form_field_at_parser_limit_is_still_accepted() -> None:
+    response = asyncio.run(
+        send_request(
+            "POST",
+            "/api/v1/generations",
+            files={"image": ("sample.png", make_image_bytes(), "image/png")},
+            data={"product_name": "x" * (1024 * 1024)},
+        )
+    )
+
+    assert response.status_code == 200
+
+
+def test_unrelated_http_exception_keeps_fastapi_default_response() -> None:
+    response = asyncio.run(send_request("GET", "/missing-route"))
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
+
+
+def test_method_not_allowed_keeps_default_response_and_allow_header() -> None:
+    response = asyncio.run(send_request("GET", "/api/v1/generations"))
+
+    assert response.status_code == 405
+    assert response.json() == {"detail": "Method Not Allowed"}
+    assert response.headers["allow"] == "POST"
+
+
+def test_same_http_detail_without_parser_context_is_not_reclassified() -> None:
+    application = build_test_app()
+
+    @application.post("/synthetic-http-error")
+    async def synthetic_http_error() -> None:
+        raise StarletteHTTPException(
+            status_code=400,
+            detail="Part exceeded maximum size of 1024KB.",
+        )
+
+    response = asyncio.run(
+        send_request(
+            "POST",
+            "/synthetic-http-error",
+            application=application,
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Part exceeded maximum size of 1024KB."
+    }
+
+
+def test_other_multipart_parser_error_is_not_reclassified() -> None:
+    response = asyncio.run(
+        send_request(
+            "POST",
+            "/api/v1/generations",
+            headers={"Content-Type": "multipart/form-data"},
+            content=b"",
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Missing boundary in multipart."}
 
 
 def test_configured_frontend_origin_passes_cors_preflight() -> None:

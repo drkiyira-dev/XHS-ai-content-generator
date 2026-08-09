@@ -44,7 +44,10 @@ class GenerationResponse(TypedDict):
 @router.post(
     "",
     responses={
-        400: {"model": ErrorResponse, "description": "Image is missing"},
+        400: {
+            "model": ErrorResponse,
+            "description": "Image is missing or a form field is too large",
+        },
         413: {"model": ErrorResponse, "description": "Image is too large"},
         415: {"model": ErrorResponse, "description": "Image type is unsupported"},
         422: {"model": ErrorResponse, "description": "Image cannot be decoded"},
