@@ -930,7 +930,7 @@ def test_cancellation_during_safety_rewrite_drops_first_output(
 def test_parser_removes_json_fence_and_normalizes_tag_prefixes() -> None:
     content = """```json
 {"image_summary":"帆布包","title":"轻装上课","body":"自然正文",\
-"tags":["校园"," #帆布包 ","#日常"]}
+"tags":["校园"," #帆布包 ","##日常##"]}
 ```"""
 
     result = parse_generated_copy(content)
@@ -1077,6 +1077,19 @@ def test_ocr_category_guard_allows_explicit_visual_correction() -> None:
             ),
             "schema_validation",
             ("tag_count",),
+        ),
+        (
+            json.dumps(
+                {
+                    "image_summary": "图片",
+                    "title": "标题",
+                    "body": "正文",
+                    "tags": ["重复", "#重复", "##重复##"],
+                },
+                ensure_ascii=False,
+            ),
+            "schema_validation",
+            ("invalid_tags",),
         ),
         (
             json.dumps(

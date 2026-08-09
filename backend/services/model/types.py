@@ -42,16 +42,17 @@ class GeneratedCopy(BaseModel):
             raise ValueError("tags must be an array")
 
         normalized: list[str] = []
+        seen: set[str] = set()
         for item in value:
             if not isinstance(item, str):
                 raise ValueError("each tag must be a string")
-            tag = item.strip()
-            if not tag:
+            tag_text = item.strip().strip("#").strip()
+            if not tag_text:
                 raise ValueError("tags must not be empty")
-            if not tag.startswith("#"):
-                tag = f"#{tag}"
-            if tag == "#":
-                raise ValueError("tags must contain text")
+            tag = f"#{tag_text}"
+            if tag in seen:
+                raise ValueError("tags must be unique")
+            seen.add(tag)
             normalized.append(tag)
         return tuple(normalized)
 

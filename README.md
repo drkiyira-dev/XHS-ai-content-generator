@@ -190,7 +190,8 @@ python -m pytest
 
 当前版本只完成成员 B 的独立生成后端。以下内容仍待团队联调：
 
-- 接入成员 C 提供的 `create_pending`、`validate_copy`、`mark_success`、`mark_failed` 持久化接口。
+- 接入成员 C 对 `GenerationPersistence` 的适配实现；适配器必须复用 B 生成的
+  `generation_id`，并在 `mark_success` 内完成 C 的 `validate_copy` 与数据库写入。
 - 使用真实 MySQL 验证 `DATABASE_ERROR`、事务回滚和状态一致性。
 - 由成员 A 接入真实上传页、Loading、结果展示和复制按钮。
 - 完成商品、食物、风景、带文字图片及异常路径的团队验收记录。
