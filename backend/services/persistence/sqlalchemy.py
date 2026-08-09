@@ -4,7 +4,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TypeVar
 
-from anyio import to_thread
+from anyio import CapacityLimiter, to_thread
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.db import (
@@ -40,9 +40,11 @@ class SQLAlchemyGenerationPersistence:
         session_factory: sessionmaker[Session],
         *,
         clock: Callable[[], datetime] = _utc_now,
+        limiter: CapacityLimiter | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._clock = clock
+        self._limiter = limiter
 
     async def create_pending(self, record: PendingGeneration) -> None:
         """Persist B's identifier before the model call starts."""
@@ -68,6 +70,7 @@ class SQLAlchemyGenerationPersistence:
                 operation,
                 record,
                 abandon_on_cancel=False,
+                limiter=self._limiter,
             )
         except Exception:
             failed = True

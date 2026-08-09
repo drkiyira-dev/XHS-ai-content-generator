@@ -131,6 +131,7 @@ def make_settings(**overrides) -> Settings:
         "MODEL_TIMEOUT_SECONDS": 10,
         "OCR_TIMEOUT_SECONDS": 0.25,
         "CORS_ALLOW_ORIGINS": "http://localhost:5173",
+        "DATABASE_ENABLED": False,
     }
     values.update(overrides)
     return Settings(**values, _env_file=None)

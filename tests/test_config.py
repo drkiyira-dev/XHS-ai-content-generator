@@ -1,5 +1,6 @@
 """Tests for secure environment-based backend configuration."""
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -7,6 +8,10 @@ import pytest
 from pydantic import ValidationError
 
 from backend.core.config import ENV_FILE, PROJECT_ROOT, Settings, get_settings
+from backend.services.persistence.runtime import (
+    DatabaseStartupError,
+    create_sqlalchemy_persistence_runtime,
+)
 
 
 SETTINGS_ENV_NAMES = (
@@ -21,6 +26,16 @@ SETTINGS_ENV_NAMES = (
     "MAX_IMAGE_SIZE_MB",
     "MAX_IMAGE_PIXELS",
     "MODEL_MAX_IMAGE_EDGE",
+    "DATABASE_ENABLED",
+    "DATABASE_URL",
+    "DATABASE_CONNECT_TIMEOUT_SECONDS",
+    "DATABASE_READ_TIMEOUT_SECONDS",
+    "DATABASE_WRITE_TIMEOUT_SECONDS",
+    "DATABASE_POOL_SIZE",
+    "DATABASE_MAX_OVERFLOW",
+    "DATABASE_POOL_TIMEOUT_SECONDS",
+    "DATABASE_POOL_RECYCLE_SECONDS",
+    "DATABASE_TLS_CA",
 )
 SETTINGS_ENV_NAMES_CASEFOLDED = {name.casefold() for name in SETTINGS_ENV_NAMES}
 
@@ -34,6 +49,9 @@ def set_required_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
     monkeypatch.setenv("VISION_MODEL_NAME", "qwen-test-model")
     monkeypatch.setenv("OCR_MODEL_NAME", "paddle-test-model")
+    monkeypatch.setenv("DATABASE_ENABLED", "false")
+    monkeypatch.setenv("DATABASE_URL", "")
+    monkeypatch.setenv("DATABASE_TLS_CA", "")
 
 
 def test_loads_required_values_and_contract_defaults(
@@ -57,6 +75,16 @@ def test_loads_required_values_and_contract_defaults(
     assert settings.max_image_size_mb == 10
     assert settings.max_image_pixels == 50_000_000
     assert settings.model_max_image_edge == 3584
+    assert settings.database_enabled is False
+    assert settings.database_url is None
+    assert settings.database_connect_timeout_seconds == 5
+    assert settings.database_read_timeout_seconds == 30
+    assert settings.database_write_timeout_seconds == 30
+    assert settings.database_pool_size == 5
+    assert settings.database_max_overflow == 5
+    assert settings.database_pool_timeout_seconds == 5
+    assert settings.database_pool_recycle_seconds == 1800
+    assert settings.database_tls_ca is None
 
 
 @pytest.mark.parametrize(
@@ -107,6 +135,125 @@ def test_masks_api_key_in_settings_representation(
 
     assert "test-secret-key" not in repr(settings)
     assert str(settings.siliconflow_api_key) == "**********"
+
+
+def test_masks_database_url_everywhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_required_environment(monkeypatch)
+    private_url = (
+        "mysql+pymysql://xhs_app:private-db-password@"
+        "127.0.0.1:3306/xhs_ai_test"
+    )
+    monkeypatch.setenv("DATABASE_ENABLED", "true")
+    monkeypatch.setenv("DATABASE_URL", private_url)
+
+    settings = Settings(_env_file=None)
+
+    assert "private-db-password" not in repr(settings)
+    assert private_url not in repr(settings)
+    assert "private-db-password" not in settings.model_dump_json()
+    assert str(settings.database_url) == "**********"
+
+
+def test_database_url_is_required_only_after_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_required_environment(monkeypatch)
+    monkeypatch.setenv("DATABASE_ENABLED", "true")
+
+    settings = Settings(_env_file=None)
+    with pytest.raises(DatabaseStartupError) as error:
+        create_sqlalchemy_persistence_runtime(settings)
+
+    assert str(error.value) == "database startup verification failed"
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "sqlite+pysqlite:///unsafe.sqlite3",
+        "mysql://xhs_app:secret@127.0.0.1/xhs_ai_test",
+        "mysql+pymysql://root:secret@127.0.0.1/xhs_ai_test",
+        "mysql+pymysql://xhs_app@127.0.0.1/xhs_ai_test",
+        "mysql+pymysql://xhs_app:secret@127.0.0.1",
+        (
+            "mysql+pymysql://xhs_app:secret@127.0.0.1/xhs_ai_test"
+            "?local_infile=1"
+        ),
+    ],
+)
+def test_rejects_unsafe_database_urls_without_exposing_them(
+    monkeypatch: pytest.MonkeyPatch,
+    database_url: str,
+) -> None:
+    set_required_environment(monkeypatch)
+    monkeypatch.setenv("DATABASE_ENABLED", "true")
+    monkeypatch.setenv("DATABASE_URL", database_url)
+
+    settings = Settings(_env_file=None)
+    with pytest.raises(DatabaseStartupError) as error:
+        create_sqlalchemy_persistence_runtime(settings)
+
+    rendered_error = repr(error.value)
+    assert database_url not in rendered_error
+    assert "secret" not in rendered_error
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_remote_database_requires_an_existing_tls_ca(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    set_required_environment(monkeypatch)
+    monkeypatch.setenv("DATABASE_ENABLED", "true")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "mysql+pymysql://xhs_app:secret@db.example.com/xhs_ai_test",
+    )
+
+    settings_without_ca = Settings(_env_file=None)
+    with pytest.raises(DatabaseStartupError) as missing_ca:
+        create_sqlalchemy_persistence_runtime(settings_without_ca)
+    assert str(missing_ca.value) == "database startup verification failed"
+
+    ca_path = tmp_path / "mysql-ca.pem"
+    ca_path.write_text("test-only-ca", encoding="utf-8")
+    monkeypatch.setenv("DATABASE_TLS_CA", str(ca_path))
+
+    settings = Settings(_env_file=None)
+    runtime = create_sqlalchemy_persistence_runtime(settings)
+    asyncio.run(runtime.aclose())
+
+    assert settings.resolved_database_tls_ca == ca_path
+
+
+def test_unrelated_validation_errors_do_not_retain_any_secret_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_required_environment(monkeypatch)
+    api_secret = "private-provider-key-in-settings"
+    database_secret = "private-database-password-in-settings"
+    monkeypatch.setenv("SILICONFLOW_API_KEY", api_secret)
+    monkeypatch.setenv("MODEL_TIMEOUT_SECONDS", "20")
+    monkeypatch.setenv("OCR_TIMEOUT_SECONDS", "11")
+    monkeypatch.setenv("DATABASE_ENABLED", "true")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        f"mysql+pymysql://xhs_app:{database_secret}@127.0.0.1/xhs_ai_test",
+    )
+
+    with pytest.raises(ValidationError) as caught:
+        Settings(_env_file=None)
+
+    rendered_errors = repr(caught.value.errors())
+    rendered_json = caught.value.json()
+    for secret in (api_secret, database_secret):
+        assert secret not in rendered_errors
+        assert secret not in rendered_json
 
 
 def test_hides_invalid_secret_input_from_validation_errors(

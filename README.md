@@ -14,7 +14,9 @@
 - 统一处理模型失败、超时、输出无效和服务器内部错误，不向客户端暴露 Key 或堆栈。
 - 成功和失败后都会清理上传及预处理临时文件。
 
-当前尚未接入成员 C 的 MySQL 持久化接口，因此生成结果暂不写入数据库。
+成员 C 的数据库核心已经通过 B 的异步适配器接入应用生命周期。MySQL 持久化默认
+关闭，未启用时继续使用 No-op；显式启用后若启动检查失败，应用会终止启动，不会假装
+写库成功。真实 MySQL 验收完成前，不应宣称数据库联调已经完成。
 
 ## 环境要求
 
@@ -64,8 +66,43 @@ SILICONFLOW_API_KEY=在此填写真实Key
 | `MAX_IMAGE_SIZE_MB` | 单张图片最大体积 | `10` |
 | `MAX_IMAGE_PIXELS` | 解码后最大总像素数 | `50000000` |
 | `MODEL_MAX_IMAGE_EDGE` | 送入模型前的最长边 | `3584` |
+| `DATABASE_ENABLED` | 是否显式启用 MySQL 持久化 | `false` |
+| `DATABASE_URL` | 受保护的 `mysql+pymysql` 连接地址 | 空 |
+| `DATABASE_CONNECT_TIMEOUT_SECONDS` | MySQL 建连超时 | `5` |
+| `DATABASE_READ_TIMEOUT_SECONDS` | MySQL 读取超时 | `30` |
+| `DATABASE_WRITE_TIMEOUT_SECONDS` | MySQL 写入超时 | `30` |
+| `DATABASE_POOL_SIZE` | 常驻连接池上限 | `5` |
+| `DATABASE_MAX_OVERFLOW` | 连接池临时额外连接上限 | `5` |
+| `DATABASE_POOL_TIMEOUT_SECONDS` | 等待连接池的最长时间 | `5` |
+| `DATABASE_POOL_RECYCLE_SECONDS` | 连接回收周期 | `1800` |
+| `DATABASE_TLS_CA` | 远程 MySQL 的 CA 证书路径 | 空 |
 
 安全要求：不得提交真实 `.env`、API Key、上传图片、日志或模型原始响应。项目的 `.gitignore` 已忽略这些内容。
+
+## MySQL 持久化（默认关闭）
+
+数据库开关关闭时，应用不会创建 Engine、连接 MySQL 或执行 SQL，Swagger 行为与此前
+一致。启用前必须先准备：
+
+- 已存在的专用数据库；
+- 有限权限的非 `root` 用户；
+- 已执行 [migrations/001_generation_records.sql](migrations/001_generation_records.sql)
+  的 `generation_records` 表；
+- 远程数据库还必须准备 CA 文件并配置 `DATABASE_TLS_CA`。
+
+迁移文件不会创建、选择或删除数据库，只会在操作者已经明确选中的数据库中创建项目表。
+应用启动本身也不会自动建库、建表或修改 schema。
+
+准备完成后，在本地 `.env` 中填写，不要把密码发送到聊天或提交 Git：
+
+```dotenv
+DATABASE_ENABLED=true
+DATABASE_URL=mysql+pymysql://xhs_app:在此填写密码@127.0.0.1:3306/xhs_ai_test
+```
+
+只允许 `mysql+pymysql`，并拒绝空密码、`root` 用户、URL query 参数以及缺少 CA 的远程
+地址。启动时会进行一次只读连通性和表存在性检查；检查失败会安全终止启动，不会静默
+退回 No-op。Engine 固定隐藏 SQL 参数，并设置连接、读写和连接池超时。
 
 ## 启动后端
 
@@ -150,8 +187,8 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/generations' \
 | 500 | `DATABASE_ERROR` | 生成结果暂时无法保存 | 是 |
 | 500 | `INTERNAL_ERROR` | 未分类的服务器内部错误 | 否 |
 
-B 侧已经预留 `DATABASE_ERROR`；当前仍使用 No-op 持久化实现，需在成员 C
-适配器接入后完成真实 MySQL 失败验证。
+B 侧已经预留 `DATABASE_ERROR`，并已接入成员 C 的适配器；仍需在专用测试库完成真实
+MySQL 成功、失败和数据库中断验证。
 
 ## 处理流程
 
@@ -159,12 +196,12 @@ B 侧已经预留 `DATABASE_ERROR`；当前仍使用 No-op 持久化实现，需
 上传图片
   → 文件类型、魔数、体积、解码和尺寸校验
   → EXIF、透明通道、RGB 与缩放预处理
-  → create_pending（当前为 No-op）
+  → create_pending（MySQL 未显式启用时为 No-op）
   → PaddleOCR-VL（失败时安全降级）
   → Qwen3-VL 图片理解与文案生成
   → JSON 解析、字段归一化与有限重试
   → 事实安全校验
-  → mark_success / mark_failed（当前为 No-op）
+  → mark_success / mark_failed（MySQL 未显式启用时为 No-op）
   → 返回固定 API 响应
 ```
 
@@ -207,9 +244,8 @@ CI 包含两个互相独立的任务：
 
 当前版本只完成成员 B 的独立生成后端。以下内容仍待团队联调：
 
-- 接入成员 C 对 `GenerationPersistence` 的适配实现；适配器必须复用 B 生成的
-  `generation_id`，并在 `mark_success` 内完成 C 的 `validate_copy` 与数据库写入。
-- 使用真实 MySQL 验证 `DATABASE_ERROR`、事务回滚和状态一致性。
+- 使用真实 MySQL 验证同一 `generation_id`、`DATABASE_ERROR`、事务回滚、状态一致性和
+  服务重启后的数据保留；当前自动化测试只验证了 SQLite 与运行时装配。
 - 由成员 A 接入真实上传页、Loading、结果展示和复制按钮。
 - 完成商品、食物、风景、带文字图片及异常路径的团队验收记录。
 - 通过 Pull Request 将 `feat/b-generation-api` 合并到 `develop`；禁止直接推送 `main`。

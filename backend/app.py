@@ -21,9 +21,26 @@ from backend.services.persistence import (
     GenerationPersistence,
     NoOpGenerationPersistence,
 )
+from backend.services.persistence.runtime import (
+    SQLAlchemyPersistenceRuntime,
+    create_sqlalchemy_persistence_runtime,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+async def _close_database_runtime_best_effort(
+    runtime: SQLAlchemyPersistenceRuntime,
+) -> None:
+    """Release the Engine without replacing an earlier startup/application error."""
+    try:
+        await runtime.aclose()
+    except Exception as error:
+        logger.error(
+            "Database runtime shutdown failed type=%s",
+            type(error).__name__,
+        )
 
 
 def create_app(
@@ -44,13 +61,37 @@ def create_app(
         )
         runtime_model_service = owned_model_service
 
+    fallback_generation_persistence = (
+        generation_persistence
+        if generation_persistence is not None
+        else NoOpGenerationPersistence()
+    )
+
     @asynccontextmanager
-    async def lifespan(_application: FastAPI):
+    async def lifespan(application: FastAPI):
+        owned_database_runtime: SQLAlchemyPersistenceRuntime | None = None
         try:
+            if generation_persistence is None and settings.database_enabled:
+                owned_database_runtime = create_sqlalchemy_persistence_runtime(
+                    settings
+                )
+                await owned_database_runtime.startup()
+                application.state.generation_persistence = (
+                    owned_database_runtime.persistence
+                )
             yield
         finally:
-            if owned_model_service is not None:
-                await owned_model_service.aclose()
+            application.state.generation_persistence = (
+                fallback_generation_persistence
+            )
+            try:
+                if owned_database_runtime is not None:
+                    await _close_database_runtime_best_effort(
+                        owned_database_runtime
+                    )
+            finally:
+                if owned_model_service is not None:
+                    await owned_model_service.aclose()
 
     application = FastAPI(
         title="XHS AI Content Generator API",
@@ -59,11 +100,7 @@ def create_app(
     )
     application.state.settings = settings
     application.state.model_service = runtime_model_service
-    application.state.generation_persistence = (
-        generation_persistence
-        if generation_persistence is not None
-        else NoOpGenerationPersistence()
-    )
+    application.state.generation_persistence = fallback_generation_persistence
     register_exception_handlers(application)
 
     @application.middleware("http")

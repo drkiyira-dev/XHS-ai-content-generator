@@ -50,6 +50,7 @@ def build_test_app(
         "VISION_MODEL_NAME": "qwen-test-model",
         "OCR_MODEL_NAME": "paddle-test-model",
         "CORS_ALLOW_ORIGINS": "http://localhost:5173",
+        "DATABASE_ENABLED": False,
     }
     values.update(overrides)
     settings = Settings(**values, _env_file=None)

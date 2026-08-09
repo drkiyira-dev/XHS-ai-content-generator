@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import Field, HttpUrl, SecretStr, field_validator, model_validator
+from pydantic import Field, HttpUrl, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -71,6 +71,63 @@ class Settings(BaseSettings):
         le=3584,
         validation_alias="MODEL_MAX_IMAGE_EDGE",
     )
+    database_enabled: bool = Field(
+        default=False,
+        validation_alias="DATABASE_ENABLED",
+        description="Explicit opt-in for MySQL-backed generation persistence.",
+    )
+    database_url: SecretStr | None = Field(
+        default=None,
+        validation_alias="DATABASE_URL",
+        description="MySQL SQLAlchemy URL; never logged or returned by the API.",
+    )
+    database_connect_timeout_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=30,
+        validation_alias="DATABASE_CONNECT_TIMEOUT_SECONDS",
+    )
+    database_read_timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=300,
+        validation_alias="DATABASE_READ_TIMEOUT_SECONDS",
+    )
+    database_write_timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=300,
+        validation_alias="DATABASE_WRITE_TIMEOUT_SECONDS",
+    )
+    database_pool_size: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        validation_alias="DATABASE_POOL_SIZE",
+    )
+    database_max_overflow: int = Field(
+        default=5,
+        ge=0,
+        le=20,
+        validation_alias="DATABASE_MAX_OVERFLOW",
+    )
+    database_pool_timeout_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+        validation_alias="DATABASE_POOL_TIMEOUT_SECONDS",
+    )
+    database_pool_recycle_seconds: int = Field(
+        default=1800,
+        ge=60,
+        le=7200,
+        validation_alias="DATABASE_POOL_RECYCLE_SECONDS",
+    )
+    database_tls_ca: Path | None = Field(
+        default=None,
+        validation_alias="DATABASE_TLS_CA",
+        description="CA certificate required for a non-loopback MySQL host.",
+    )
 
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,
@@ -90,15 +147,43 @@ class Settings(BaseSettings):
             raise ValueError("SILICONFLOW_API_KEY must not be empty")
         return SecretStr(secret)
 
-    @model_validator(mode="after")
-    def validate_model_phase_timeouts(self) -> "Settings":
+    @field_validator("ocr_timeout_seconds")
+    @classmethod
+    def validate_model_phase_timeouts(
+        cls,
+        value: float,
+        info: ValidationInfo,
+    ) -> float:
         """Give the required Qwen phase at least half of the total deadline."""
-        if self.ocr_timeout_seconds > self.model_timeout_seconds / 2:
+        model_timeout_seconds = info.data.get("model_timeout_seconds")
+        if (
+            isinstance(model_timeout_seconds, int)
+            and value > model_timeout_seconds / 2
+        ):
             raise ValueError(
                 "OCR_TIMEOUT_SECONDS must not exceed half of "
                 "MODEL_TIMEOUT_SECONDS"
             )
-        return self
+        return value
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value: object) -> object:
+        """Treat a blank template value as absent without exposing a URL."""
+        if isinstance(value, SecretStr):
+            return value if value.get_secret_value().strip() else None
+        if isinstance(value, str):
+            normalized = value.strip()
+            return SecretStr(normalized) if normalized else None
+        return None
+
+    @field_validator("database_tls_ca", mode="before")
+    @classmethod
+    def normalize_database_tls_ca(cls, value: object) -> object:
+        """Treat the optional blank template value as no CA path."""
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
 
     @field_validator("siliconflow_base_url")
     @classmethod
@@ -168,6 +253,15 @@ class Settings(BaseSettings):
         if self.upload_dir.is_absolute():
             return self.upload_dir
         return PROJECT_ROOT / self.upload_dir
+
+    @property
+    def resolved_database_tls_ca(self) -> Path:
+        """Resolve the optional database CA path against the repository root."""
+        if self.database_tls_ca is None:
+            raise RuntimeError("database TLS CA is not configured")
+        if self.database_tls_ca.is_absolute():
+            return self.database_tls_ca
+        return PROJECT_ROOT / self.database_tls_ca
 
     @field_validator("upload_dir", mode="before")
     @classmethod

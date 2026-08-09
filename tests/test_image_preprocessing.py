@@ -25,6 +25,7 @@ def build_settings(tmp_path: Path, *, max_edge: int = 3584) -> Settings:
         OCR_MODEL_NAME="paddle-test-model",
         UPLOAD_DIR=str(tmp_path),
         MODEL_MAX_IMAGE_EDGE=max_edge,
+        DATABASE_ENABLED=False,
         _env_file=None,
     )
 
