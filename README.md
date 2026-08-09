@@ -187,6 +187,22 @@ python -m pytest
 
 真实 API 测试会产生模型调用费用；自动化测试默认使用 Mock，不会调用硅基流动。
 
+## GitHub Actions 自动检查
+
+仓库的 `CI` workflow 会在以下情况自动运行：
+
+- 向 `develop` 或 `main` 提交 Pull Request。
+- `develop` 或 `main` 收到新的提交。
+- 在 GitHub Actions 页面手动触发。
+
+CI 包含两个互相独立的任务：
+
+- Python 3.12：安装后端开发依赖并运行全部 `pytest`。
+- Node.js 24：使用 `npm ci` 按锁文件安装前端依赖并执行生产构建。
+
+该 workflow 只有仓库内容读取权限，不使用硅基流动 Key、不连接 MySQL、
+不部署应用，也不会自动修改或合并 PR。重复推送同一分支时，较旧的运行会被取消。
+
 ## 当前范围与后续工作
 
 当前版本只完成成员 B 的独立生成后端。以下内容仍待团队联调：
