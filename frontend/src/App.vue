@@ -3,7 +3,12 @@ import { ref, reactive } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { UploadInstance } from 'element-plus'
 import { DocumentCopy, RefreshRight, Delete } from '@element-plus/icons-vue'
-import { generate, type GenerationResponse, GenerationError } from './services/generation'
+import {
+  generate,
+  listGenerations,
+  type GenerationResponse,
+  GenerationError
+} from './services/generation'
 
 // ===== 页面状态 =====
 // idle: 空闲
@@ -14,6 +19,18 @@ type Status = 'idle' | 'loading' | 'success' | 'error'
 const status = ref<Status>('idle')
 const errorMessage = ref('')
 const errorRetryable = ref(false)
+
+// ===== 页面切换与历史记录状态 =====
+type ActiveView = 'generate' | 'history'
+type HistoryStatus = 'idle' | 'loading' | 'success' | 'error'
+const HISTORY_LIMIT = 20
+const activeView = ref<ActiveView>('generate')
+const historyStatus = ref<HistoryStatus>('idle')
+const historyItems = ref<GenerationResponse[]>([])
+const historyCount = ref(0)
+const historyError = ref('')
+const historyLoaded = ref(false)
+let historyRevision = 0
 
 // ===== 用户输入 =====
 const form = reactive({
@@ -251,6 +268,11 @@ async function handleGenerate() {
     const data = await generate(formData)
     Object.assign(result, data)
     status.value = 'success'
+    historyRevision += 1
+    historyLoaded.value = false
+    if (activeView.value === 'history') {
+      void loadHistory()
+    }
   } catch (err: any) {
     status.value = 'error'
     if (err instanceof GenerationError) {
@@ -263,14 +285,84 @@ async function handleGenerate() {
   }
 }
 
-// ===== 复制全部文案 =====
-function copyAll() {
-  const text = `标题：${result.title}\n\n正文：\n${result.body}\n\n标签：${result.tags.join(' ')}`
-  navigator.clipboard.writeText(text).then(() => {
-    ElMessage.success('已复制到剪贴板')
-  }).catch(() => {
+// ===== 历史记录 =====
+async function showHistory() {
+  activeView.value = 'history'
+  if (!historyLoaded.value) {
+    await loadHistory()
+  }
+}
+
+function showGenerator() {
+  activeView.value = 'generate'
+}
+
+async function loadHistory() {
+  if (historyStatus.value === 'loading') {
+    return
+  }
+
+  historyStatus.value = 'loading'
+  historyError.value = ''
+  const requestedRevision = historyRevision
+
+  try {
+    const data = await listGenerations(HISTORY_LIMIT)
+    if (requestedRevision !== historyRevision) {
+      historyStatus.value = 'idle'
+      await loadHistory()
+      return
+    }
+
+    historyItems.value = data.items
+    historyCount.value = data.count
+    historyLoaded.value = true
+    historyStatus.value = 'success'
+  } catch (err: unknown) {
+    if (requestedRevision !== historyRevision) {
+      historyStatus.value = 'idle'
+      await loadHistory()
+      return
+    }
+
+    historyStatus.value = 'error'
+    historyLoaded.value = false
+    historyError.value = err instanceof GenerationError
+      ? err.message
+      : '历史记录读取失败，请稍后重试'
+  }
+}
+
+function formatCreatedAt(value: string): string {
+  const createdAt = new Date(value)
+  if (Number.isNaN(createdAt.getTime())) {
+    return '时间未知'
+  }
+
+  return new Intl.DateTimeFormat('zh-CN', {
+    dateStyle: 'medium',
+    timeStyle: 'short'
+  }).format(createdAt)
+}
+
+// ===== 复制文案 =====
+async function copyGeneration(generation: GenerationResponse) {
+  const text = `标题：${generation.title}\n\n正文：\n${generation.body}\n\n标签：${generation.tags.join(' ')}`
+  if (!navigator.clipboard?.writeText) {
     ElMessage.error('复制失败，请手动复制')
-  })
+    return
+  }
+
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success('已复制到剪贴板')
+  } catch {
+    ElMessage.error('复制失败，请手动复制')
+  }
+}
+
+function copyAll() {
+  void copyGeneration(result)
 }
 </script>
 
@@ -279,7 +371,34 @@ function copyAll() {
     <h1 class="title">小红书文案生成平台</h1>
     <p class="subtitle">上传一张图，AI 帮你写小红书笔记</p>
 
-    <div class="card">
+    <nav class="view-switch" aria-label="页面导航">
+      <el-button
+        id="generator-nav-button"
+        :type="activeView === 'generate' ? 'primary' : 'default'"
+        :aria-pressed="activeView === 'generate'"
+        aria-controls="generator-panel"
+        @click="showGenerator"
+      >
+        生成文案
+      </el-button>
+      <el-button
+        id="history-nav-button"
+        :type="activeView === 'history' ? 'primary' : 'default'"
+        :aria-pressed="activeView === 'history'"
+        aria-controls="history-panel"
+        @click="showHistory"
+      >
+        历史记录
+      </el-button>
+    </nav>
+
+    <section
+      v-show="activeView === 'generate'"
+      id="generator-panel"
+      class="card"
+      role="region"
+      aria-labelledby="generator-nav-button"
+    >
       <!-- 图片上传 -->
       <div class="section">
         <label class="label">1. 上传图片</label>
@@ -408,7 +527,105 @@ function copyAll() {
           </div>
         </div>
       </div>
-    </div>
+    </section>
+
+    <section
+      v-show="activeView === 'history'"
+      id="history-panel"
+      class="card history-panel"
+      role="region"
+      aria-labelledby="history-nav-button"
+      :aria-busy="historyStatus === 'loading'"
+    >
+      <div class="history-header">
+        <div>
+          <h2>历史记录</h2>
+          <p>仅显示最近 {{ HISTORY_LIMIT }} 条成功记录，本功能限本地单用户使用。</p>
+        </div>
+        <el-button
+          :icon="RefreshRight"
+          :loading="historyStatus === 'loading'"
+          :disabled="historyStatus === 'loading'"
+          @click="loadHistory"
+        >
+          刷新
+        </el-button>
+      </div>
+
+      <div
+        v-if="historyStatus === 'loading'"
+        class="history-state"
+        role="status"
+        aria-live="polite"
+      >
+        <p>正在读取历史记录...</p>
+        <el-skeleton :rows="4" animated />
+      </div>
+
+      <div
+        v-else-if="historyStatus === 'error'"
+        class="history-state"
+      >
+        <el-alert
+          title="历史记录读取失败"
+          :description="historyError"
+          type="error"
+          show-icon
+          :closable="false"
+        />
+        <el-button type="primary" :icon="RefreshRight" @click="loadHistory">
+          重新加载
+        </el-button>
+      </div>
+
+      <el-empty
+        v-else-if="historyStatus === 'success' && historyItems.length === 0"
+        description="暂无历史记录"
+      >
+        <p class="empty-hint">
+          MySQL 未启用时历史记录为空；完成一次生成后可在这里查看结果。
+        </p>
+      </el-empty>
+
+      <div
+        v-else-if="historyStatus === 'success'"
+        class="history-results"
+        aria-live="polite"
+      >
+        <p class="history-count">本次读取 {{ historyCount }} 条成功记录</p>
+        <article
+          v-for="item in historyItems"
+          :key="item.generation_id"
+          class="history-item"
+        >
+          <div class="history-item-header">
+            <div>
+              <h3>{{ item.title }}</h3>
+              <time :datetime="item.created_at">{{ formatCreatedAt(item.created_at) }}</time>
+            </div>
+            <el-button
+              type="success"
+              plain
+              :icon="DocumentCopy"
+              :aria-label="`复制历史文案：${item.title}`"
+              @click="copyGeneration(item)"
+            >
+              复制文案
+            </el-button>
+          </div>
+
+          <p class="history-summary">
+            <strong>图片理解：</strong>{{ item.image_summary }}
+          </p>
+          <p class="history-body">{{ item.body }}</p>
+          <div class="tags" aria-label="历史记录标签">
+            <el-tag v-for="tag in item.tags" :key="tag" type="primary">
+              {{ tag }}
+            </el-tag>
+          </div>
+        </article>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -431,6 +648,17 @@ function copyAll() {
   text-align: center;
   color: #6b7280;
   margin-bottom: 32px;
+}
+
+.view-switch {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.view-switch .el-button + .el-button {
+  margin-left: 0;
 }
 
 .card {
@@ -552,5 +780,128 @@ function copyAll() {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.history-panel {
+  text-align: left;
+}
+
+.history-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.history-header h2 {
+  margin: 0 0 8px;
+  color: #1f2937;
+  font-size: 20px;
+}
+
+.history-header p,
+.history-count,
+.empty-hint {
+  margin: 0;
+  color: #6b7280;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.history-state {
+  display: grid;
+  gap: 20px;
+  margin-top: 24px;
+}
+
+.history-state > p {
+  margin: 0;
+  color: #6b7280;
+}
+
+.history-results {
+  display: grid;
+  gap: 16px;
+  margin-top: 20px;
+}
+
+.history-item {
+  padding: 20px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fdfdfd;
+  overflow-wrap: anywhere;
+}
+
+.history-item-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.history-item-header h3 {
+  margin: 0 0 6px;
+  color: #ff2442;
+  font-size: 18px;
+}
+
+.history-item-header time {
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.history-summary,
+.history-body {
+  margin: 0 0 16px;
+  color: #1f2937;
+  line-height: 1.65;
+}
+
+.history-summary {
+  padding: 12px;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.history-body {
+  white-space: pre-wrap;
+}
+
+@media (max-width: 640px) {
+  .app {
+    padding: 24px 12px;
+  }
+
+  .card {
+    padding: 20px 16px;
+  }
+
+  .view-switch,
+  .history-header,
+  .history-item-header {
+    flex-wrap: wrap;
+  }
+
+  .view-switch .el-button {
+    flex: 1 1 140px;
+  }
+
+  .history-header,
+  .history-item-header {
+    align-items: stretch;
+  }
+
+  .history-header > .el-button,
+  .history-item-header > .el-button {
+    width: 100%;
+  }
+
+  .history-item {
+    padding: 16px;
+  }
 }
 </style>
