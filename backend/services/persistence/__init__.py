@@ -7,6 +7,7 @@ from backend.services.persistence.types import (
     GenerationPersistence,
     GenerationPersistenceError,
     PendingGeneration,
+    StoredGeneration,
     SuccessfulGeneration,
 )
 
@@ -18,5 +19,6 @@ __all__ = [
     "NoOpGenerationPersistence",
     "PendingGeneration",
     "SQLAlchemyGenerationPersistence",
+    "StoredGeneration",
     "SuccessfulGeneration",
 ]

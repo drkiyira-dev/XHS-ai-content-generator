@@ -33,6 +33,18 @@ class FailedGeneration:
     failed_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class StoredGeneration:
+    """One successful generation safe to expose in local history."""
+
+    generation_id: str
+    image_summary: str
+    title: str
+    body: str
+    tags: tuple[str, ...]
+    created_at: datetime
+
+
 class GenerationPersistenceError(Exception):
     """Expected storage failure without provider or database details."""
 
@@ -53,4 +65,8 @@ class GenerationPersistence(Protocol):
 
     async def mark_failed(self, record: FailedGeneration) -> None:
         """Mark the lifecycle failed using only a stable error code."""
+        ...
+
+    async def list_successful(self, *, limit: int) -> tuple[StoredGeneration, ...]:
+        """Return the most recent successful generations, newest first."""
         ...

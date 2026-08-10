@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Annotated, cast
 from uuid import uuid4
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, File, Form, Query, Request, Response, UploadFile
 from typing_extensions import TypedDict
 
 from backend.api.errors import APIError, ErrorResponse
@@ -39,6 +39,61 @@ class GenerationResponse(TypedDict):
     body: str
     tags: list[str]
     created_at: datetime
+
+
+class GenerationHistoryResponse(TypedDict):
+    """Recent successful generations for the local single-user history page."""
+
+    items: list[GenerationResponse]
+    count: int
+
+
+@router.get(
+    "",
+    responses={
+        500: {"model": ErrorResponse, "description": "Database read failure"},
+    },
+)
+async def list_generations(
+    request: Request,
+    response: Response,
+    limit: Annotated[
+        int,
+        Query(ge=1, le=50, description="Maximum successful records to return"),
+    ] = 20,
+) -> GenerationHistoryResponse:
+    """Return recent successful generations without exposing local image paths."""
+    generation_persistence = cast(
+        GenerationPersistence,
+        request.app.state.generation_persistence,
+    )
+    try:
+        records = await generation_persistence.list_successful(limit=limit)
+    except GenerationPersistenceError as error:
+        logger.error(
+            "Generation persistence failed stage=list_successful type=%s",
+            type(error).__name__,
+        )
+        raise APIError(
+            code="DATABASE_ERROR",
+            message="历史记录暂时无法读取，请稍后重试。",
+            status_code=500,
+            retryable=True,
+        ) from None
+
+    items: list[GenerationResponse] = [
+        {
+            "generation_id": record.generation_id,
+            "image_summary": record.image_summary,
+            "title": record.title,
+            "body": record.body,
+            "tags": list(record.tags),
+            "created_at": record.created_at,
+        }
+        for record in records
+    ]
+    response.headers["Cache-Control"] = "no-store"
+    return {"items": items, "count": len(items)}
 
 
 @router.post(

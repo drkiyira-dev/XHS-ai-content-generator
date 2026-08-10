@@ -129,7 +129,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
         allow_credentials=False,
-        allow_methods=["POST", "OPTIONS"],
+        allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
     application.include_router(api_v1_router, prefix="/api/v1")

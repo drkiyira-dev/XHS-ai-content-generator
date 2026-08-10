@@ -140,12 +140,12 @@ def test_unrelated_http_exception_keeps_fastapi_default_response() -> None:
     assert response.json() == {"detail": "Not Found"}
 
 
-def test_method_not_allowed_keeps_default_response_and_allow_header() -> None:
+def test_generation_history_is_empty_without_database_persistence() -> None:
     response = asyncio.run(send_request("GET", "/api/v1/generations"))
 
-    assert response.status_code == 405
-    assert response.json() == {"detail": "Method Not Allowed"}
-    assert response.headers["allow"] == "POST"
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "count": 0}
+    assert response.headers["cache-control"] == "no-store"
 
 
 def test_same_http_detail_without_parser_context_is_not_reclassified() -> None:
@@ -194,6 +194,22 @@ def test_configured_frontend_origin_passes_cors_preflight() -> None:
             headers={
                 "Origin": "http://localhost:5173",
                 "Access-Control-Request-Method": "POST",
+            },
+        )
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def test_configured_frontend_origin_can_request_history() -> None:
+    response = asyncio.run(
+        send_request(
+            "OPTIONS",
+            "/api/v1/generations",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "GET",
             },
         )
     )

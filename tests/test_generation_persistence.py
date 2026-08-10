@@ -15,6 +15,7 @@ from backend.services.persistence import (
     FailedGeneration,
     GenerationPersistenceError,
     PendingGeneration,
+    StoredGeneration,
     SuccessfulGeneration,
 )
 from tests.support import build_test_app, make_image_bytes, send_request
@@ -34,6 +35,10 @@ class RecordingPersistence:
 
     async def mark_failed(self, record: FailedGeneration) -> None:
         self.events.append(("mark_failed", record))
+
+    async def list_successful(self, *, limit: int) -> tuple[StoredGeneration, ...]:
+        _ = limit
+        return ()
 
 
 @dataclass

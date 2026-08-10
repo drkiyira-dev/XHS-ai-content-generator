@@ -5,6 +5,7 @@
 ## 已实现功能
 
 - `POST /api/v1/generations`，使用 `multipart/form-data` 上传单张图片。
+- `GET /api/v1/generations`，读取最近成功生成的本地历史记录。
 - 支持 JPG、JPEG、PNG、WebP；拒绝空文件、伪装格式、损坏图片、超限文件和异常尺寸。
 - 自动处理 EXIF 方向、透明通道、颜色模式和大图等比例缩放。
 - PaddleOCR-VL 尝试识别包装文字；OCR 失败或超时时自动降级为 Qwen3-VL 直接识图。
@@ -121,6 +122,7 @@ python -m uvicorn backend.main:app --reload
 - Swagger UI：<http://127.0.0.1:8000/docs>
 - OpenAPI JSON：<http://127.0.0.1:8000/openapi.json>
 - 生成接口：`POST http://127.0.0.1:8000/api/v1/generations`
+- 历史接口：`GET http://127.0.0.1:8000/api/v1/generations?limit=20`
 
 ## API 请求
 
@@ -162,6 +164,42 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/generations' \
 ```
 
 `generation_id` 和 `created_at` 每次请求都会变化。
+
+## 历史记录接口（本地单用户增值功能）
+
+```http
+GET /api/v1/generations?limit=20
+```
+
+- 只返回 `success` 记录，按创建时间从新到旧排列。
+- `limit` 默认为 `20`，允许范围为 `1` 到 `50`。
+- 响应沿用生成结果的 `generation_id`、`image_summary`、`title`、`body`、
+  `tags`、`created_at` 字段，并额外返回 `count`。
+- 不返回本地图片路径、用户输入、失败原因或数据库内部字段。
+- 响应带有 `Cache-Control: no-store`，避免浏览器或代理缓存生成文案。
+- `DATABASE_ENABLED=false` 时 No-op 持久化不会保存数据，因此历史固定为空。
+
+示例：
+
+```json
+{
+  "items": [
+    {
+      "generation_id": "550e8400-e29b-41d4-a716-446655440000",
+      "image_summary": "浅粉色瓶身搭配浅色标签。",
+      "title": "玫瑰果卸妆油开箱",
+      "body": "包装上可见 CLEANSING OIL、ROSE HIP 和 100 ML。",
+      "tags": ["#卸妆油", "#玫瑰果", "#护肤分享"],
+      "created_at": "2026-08-07T07:39:32.921950Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+该接口当前只面向 README 默认的 `127.0.0.1` 本地单用户演示。它没有登录鉴权或
+用户数据隔离，不得直接绑定 `0.0.0.0` 暴露到局域网或公网；若后续需要多用户部署，
+必须先增加身份认证和记录所有权过滤。
 
 ## 错误响应
 
@@ -220,6 +258,7 @@ python -m pytest
 当前测试覆盖：
 
 - API 请求字段、二进制上传和 CORS。
+- 历史记录排序、数量限制、时区、损坏记录拒绝和数据库错误脱敏。
 - 配置验证及敏感信息隐藏。
 - 图片格式、魔数、体积、解码、尺寸和多文件拒绝。
 - EXIF 方向、透明图片、大图缩放、UUID 临时文件和清理。

@@ -2,7 +2,9 @@
 
 from backend.services.persistence.types import (
     FailedGeneration,
+    GenerationPersistenceError,
     PendingGeneration,
+    StoredGeneration,
     SuccessfulGeneration,
 )
 
@@ -18,3 +20,8 @@ class NoOpGenerationPersistence:
 
     async def mark_failed(self, record: FailedGeneration) -> None:
         _ = record
+
+    async def list_successful(self, *, limit: int) -> tuple[StoredGeneration, ...]:
+        if not 1 <= limit <= 50:
+            raise GenerationPersistenceError()
+        return ()
