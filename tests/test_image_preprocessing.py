@@ -268,3 +268,34 @@ def test_output_is_private_and_uses_a_new_uuid_name(tmp_path: Path) -> None:
             assert result.mode == "RGB"
     finally:
         asyncio.run(delete_processed_image(processed))
+
+
+def test_heif_is_converted_to_private_metadata_free_jpeg(tmp_path: Path) -> None:
+    source_path = tmp_path / "validated.upload"
+    source_path.write_bytes(make_image_bytes("HEIF", size=(4, 2)))
+    validated = ValidatedImage(
+        path=source_path,
+        image_format="HEIF",
+        width=4,
+        height=2,
+        size_bytes=source_path.stat().st_size,
+    )
+
+    processed = asyncio.run(
+        preprocess_validated_image(validated, build_settings(tmp_path))
+    )
+    try:
+        assert processed.path.suffix == ".jpg"
+        assert processed.image_format == "JPEG"
+        assert processed.mime_type == "image/jpeg"
+        assert os.stat(processed.path).st_mode & 0o777 == 0o600
+        with Image.open(processed.path) as result:
+            result.load()
+            assert result.format == "JPEG"
+            assert result.mode == "RGB"
+            assert result.size == (4, 2)
+            assert result.getexif() == {}
+            for metadata_key in ("exif", "icc_profile", "xmp", "transparency"):
+                assert metadata_key not in result.info
+    finally:
+        asyncio.run(delete_processed_image(processed))

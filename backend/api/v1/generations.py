@@ -116,7 +116,10 @@ async def create_generation(
     image: Annotated[
         UploadFile,
         File(
-            description="One JPG, JPEG, PNG, or WebP image to analyze",
+            description=(
+                "One JPG, JPEG, PNG, WebP, or single-frame HEIC/HEIF image "
+                "to analyze"
+            ),
             json_schema_extra={"format": "binary"},
         ),
     ],

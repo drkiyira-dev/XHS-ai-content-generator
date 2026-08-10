@@ -6,7 +6,8 @@
 
 - `POST /api/v1/generations`，使用 `multipart/form-data` 上传单张图片。
 - `GET /api/v1/generations`，读取最近成功生成的本地历史记录。
-- 支持 JPG、JPEG、PNG、WebP；拒绝空文件、伪装格式、损坏图片、超限文件和异常尺寸。
+- 支持 JPG、JPEG、PNG、WebP，以及单帧 HEIC/HEIF；HEIC/HEIF 会在服务端安全转换为 JPEG，
+  并拒绝空文件、伪装格式、损坏图片、超限文件和异常尺寸。
 - 自动处理 EXIF 方向、透明通道、颜色模式和大图等比例缩放。
 - PaddleOCR-VL 尝试识别包装文字；OCR 失败或超时时自动降级为 Qwen3-VL 直接识图。
 - Qwen3-VL 生成固定结构的 `image_summary`、`title`、`body`、`tags`。
@@ -130,7 +131,7 @@ python -m uvicorn backend.main:app --reload
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `image` | 是 | 单张 JPG、JPEG、PNG 或 WebP 图片，模板限制为 10MB |
+| `image` | 是 | 单张 JPG、JPEG、PNG、WebP 或单帧 HEIC/HEIF 图片，模板限制为 10MB；HEIC/HEIF 会转换为 JPEG 后送入模型 |
 | `product_name` | 否 | 用户猜测的候选商品名；与图片冲突时以图片为准 |
 | `target_audience` | 否 | 调整表达角度，不能作为产品适用性的事实证据 |
 | `tone` | 否 | 调整文案风格，不能作为产品属性的事实证据 |
@@ -237,7 +238,7 @@ B 侧的 `DATABASE_ERROR` 与成员 C 的适配器已经接通。真实 MySQL �
 ```text
 上传图片
   → 文件类型、魔数、体积、解码和尺寸校验
-  → EXIF、透明通道、RGB 与缩放预处理
+  → EXIF、透明通道、RGB 与缩放预处理（HEIC/HEIF 统一转换为 JPEG）
   → create_pending（MySQL 未显式启用时为 No-op）
   → PaddleOCR-VL（失败时安全降级）
   → Qwen3-VL 图片理解与文案生成

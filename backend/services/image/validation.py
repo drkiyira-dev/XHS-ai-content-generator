@@ -1,4 +1,4 @@
-"""Secure validation for one uploaded JPEG, PNG, or WebP image."""
+"""Secure validation for one uploaded JPEG, PNG, WebP, or HEIF image."""
 
 from dataclasses import dataclass
 import os
@@ -8,24 +8,54 @@ from uuid import uuid4
 from anyio import CancelScope, to_thread
 from fastapi import UploadFile
 from PIL import Image, UnidentifiedImageError
+from pillow_heif import register_heif_opener
 
 from backend.api.errors import APIError
 from backend.core.config import Settings
 
 
 READ_CHUNK_BYTES = 1024 * 1024
-HEADER_BYTES = 16
+HEADER_BYTES = 256
+HEIF_SINGLE_IMAGE_MAJOR_BRANDS = {
+    b"heic",
+    b"heix",
+    b"heim",
+    b"heis",
+    b"mif1",
+}
+HEIF_REJECTED_BRANDS = {
+    b"avif",
+    b"avis",
+    b"hevc",
+    b"hevx",
+    b"hevm",
+    b"hevs",
+    b"msf1",
+}
+
+# Register HEIF support with Pillow. Embedded thumbnails, depth/auxiliary images,
+# and parallel decoding are unnecessary for one model input and stay disabled.
+register_heif_opener(
+    thumbnails=False,
+    depth_images=False,
+    aux_images=False,
+    decode_threads=1,
+)
 
 FORMAT_BY_EXTENSION = {
     ".jpg": "JPEG",
     ".jpeg": "JPEG",
     ".png": "PNG",
     ".webp": "WEBP",
+    ".heic": "HEIF",
+    ".heif": "HEIF",
 }
 FORMAT_BY_MIME = {
     "image/jpeg": "JPEG",
     "image/png": "PNG",
     "image/webp": "WEBP",
+    "image/heic": "HEIF",
+    "image/heif": "HEIF",
 }
 
 
@@ -114,7 +144,7 @@ def _validate_declared_type(upload: UploadFile) -> str:
     content_type = (upload.content_type or "").partition(";")[0].strip().casefold()
     mime_format = FORMAT_BY_MIME.get(content_type)
     if extension_format is None or mime_format is None:
-        raise _unsupported_image("仅支持 JPG、JPEG、PNG 和 WebP 图片。")
+        raise _unsupported_image("仅支持 JPG、JPEG、PNG、WebP、HEIC 和 HEIF 图片。")
     if extension_format != mime_format:
         raise _unsupported_image("图片扩展名与 MIME 类型不一致。")
     return extension_format
@@ -187,7 +217,30 @@ def _detect_magic_format(header: bytes) -> str | None:
         return "PNG"
     if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
         return "WEBP"
+    if _is_single_image_heif_header(header):
+        return "HEIF"
     return None
+
+
+def _is_single_image_heif_header(header: bytes) -> bool:
+    """Accept bounded single-image HEIF brands while rejecting AVIF/sequences."""
+    if len(header) < 16 or header[4:8] != b"ftyp":
+        return False
+
+    box_size = int.from_bytes(header[:4], byteorder="big")
+    if box_size < 16 or box_size > len(header) or box_size % 4 != 0:
+        return False
+
+    major_brand = header[8:12]
+    compatible_brands = {
+        header[offset : offset + 4]
+        for offset in range(16, box_size, 4)
+    }
+    all_brands = compatible_brands | {major_brand}
+    return (
+        major_brand in HEIF_SINGLE_IMAGE_MAJOR_BRANDS
+        and not all_brands.intersection(HEIF_REJECTED_BRANDS)
+    )
 
 
 def _decode_and_inspect(
@@ -211,11 +264,23 @@ def _decode_and_inspect(
                 max_image_pixels,
             )
             image.load()
+            image_format, width, height = _validate_open_image(
+                image,
+                expected_format,
+                max_image_pixels,
+            )
     except APIError:
         raise
     except Image.DecompressionBombError:
         raise _invalid_dimensions(max_image_pixels) from None
-    except (UnidentifiedImageError, OSError, SyntaxError, ValueError):
+    except (
+        UnidentifiedImageError,
+        EOFError,
+        OSError,
+        RuntimeError,
+        SyntaxError,
+        ValueError,
+    ):
         raise APIError(
             code="IMAGE_DECODE_FAILED",
             message="图片已损坏或无法解码。",
@@ -233,6 +298,11 @@ def _validate_open_image(
     image_format = (image.format or "").upper()
     width, height = image.size
 
+    if expected_format == "HEIF" and (
+        getattr(image, "n_frames", 1) != 1
+        or bool(getattr(image, "is_animated", False))
+    ):
+        raise _unsupported_image("当前接口只支持单帧 HEIC 或 HEIF 图片。")
     if width <= 0 or height <= 0 or width * height > max_image_pixels:
         raise _invalid_dimensions(max_image_pixels)
     if image_format != expected_format:

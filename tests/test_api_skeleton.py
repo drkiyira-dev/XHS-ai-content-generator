@@ -52,6 +52,8 @@ def test_openapi_marks_image_as_a_binary_multipart_file() -> None:
     assert "image" in body_schema["required"]
     assert image_schema["type"] == "string"
     assert image_schema["format"] == "binary"
+    assert "HEIC" in image_schema["description"]
+    assert "HEIF" in image_schema["description"]
     error_schema_reference = operation["responses"]["502"]["content"][
         "application/json"
     ]["schema"]["$ref"]

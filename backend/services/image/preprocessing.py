@@ -16,11 +16,18 @@ OUTPUT_SUFFIX = {
     "JPEG": ".jpg",
     "PNG": ".png",
     "WEBP": ".webp",
+    "HEIF": ".jpg",
 }
 OUTPUT_MIME = {
     "JPEG": "image/jpeg",
     "PNG": "image/png",
     "WEBP": "image/webp",
+}
+NORMALIZED_FORMAT = {
+    "JPEG": "JPEG",
+    "PNG": "PNG",
+    "WEBP": "WEBP",
+    "HEIF": "JPEG",
 }
 
 
@@ -71,6 +78,7 @@ def _preprocess_sync(
     max_edge: int,
 ) -> ProcessedImage:
     working: Image.Image | None = None
+    normalized_format = NORMALIZED_FORMAT[validated.image_format]
 
     try:
         with Image.open(validated.path) as source:
@@ -103,12 +111,12 @@ def _preprocess_sync(
             transposed.close()
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        _save_private_image(working, output_path, validated.image_format)
+        _save_private_image(working, output_path, normalized_format)
 
         return ProcessedImage(
             path=output_path,
-            image_format=validated.image_format,
-            mime_type=OUTPUT_MIME[validated.image_format],
+            image_format=normalized_format,
+            mime_type=OUTPUT_MIME[normalized_format],
             width=working.width,
             height=working.height,
             exif_transposed=exif_transposed,
