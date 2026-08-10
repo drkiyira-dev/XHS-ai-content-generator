@@ -72,17 +72,16 @@ frontend/
 
 ## 功能说明
 
-- **图片上传**：支持 JPG、PNG、WebP 格式，最大 10MB。
-- **前端校验**：校验文件扩展名、MIME 类型、文件大小，并读取文件头字节防止「改后缀冒充图片」。
+- **图片上传**：支持 JPG、JPEG、PNG、WebP 以及单帧 HEIC/HEIF，最大 10MB。
+- **前端校验**：校验文件扩展名、MIME 类型、文件大小及文件头；HEIC/HEIF 使用有界 `ftyp` 品牌检查并由后端转换为 JPEG。
 - **可选参数**：商品名称、目标受众、语气。
-- **生成结果**：展示标题、正文、标签、图片摘要、生成时间。
+- **生成结果**：展示标题、正文、标签和图片摘要。
 - **加载与错误状态**：请求过程中禁用提交按钮，遇到错误展示中文提示。
 
 ## 接口说明
 
-当前 `src/services/generation.ts` 中 `USE_MOCK = true`，使用本地 Mock 数据模拟后端响应，便于前端独立开发和演示。
-
-等后端同学完成接口后，将 `USE_MOCK` 改为 `false`，前端即会通过 `POST /api/v1/generations` 调用真实后端，接口字段保持 snake_case：
+`src/services/generation.ts` 默认通过 `POST /api/v1/generations` 调用真实后端。只有显式设置
+`VITE_USE_MOCK=true` 时才使用本地 Mock 数据；接口字段保持 snake_case：
 
 ```json
 {
