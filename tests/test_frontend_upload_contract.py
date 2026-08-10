@@ -64,4 +64,4 @@ def test_frontend_documentation_describes_the_real_api_default() -> None:
     assert "USE_MOCK = true" not in frontend_readme
     assert "VITE_USE_MOCK=true" in frontend_readme
     assert "当前版本只完成成员 B" not in root_readme
-    assert "当前 `develop` 已完成 A、B、C 三部分的整合" in root_readme
+    assert "当前 `main` 已通过 PR 完成 A、B、C 三部分的整合" in root_readme

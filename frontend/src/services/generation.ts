@@ -9,6 +9,11 @@ export interface GenerationResponse {
   created_at: string
 }
 
+export interface GenerationHistoryResponse {
+  items: GenerationResponse[]
+  count: number
+}
+
 export interface ApiErrorResponse {
   error: {
     code: string
@@ -22,6 +27,8 @@ const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
 const API_TIMEOUT = 90000 // 90 秒，模型调用可能较慢
+const HISTORY_TIMEOUT = 40000 // 覆盖后端默认数据库读取超时并保留安全错误响应
+const mockHistory: GenerationResponse[] = []
 
 // 扩展 Error，携带 code 和 retryable 供页面判断
 export class GenerationError extends Error {
@@ -43,7 +50,7 @@ async function mockGenerate(formData: FormData): Promise<GenerationResponse> {
 
   return new Promise((resolve) => {
     setTimeout(() => {
-      resolve({
+      const generated: GenerationResponse = {
         generation_id: `mock-${Date.now()}`,
         image_summary:
           '这是一张清新的饮品照片，主体是一杯装满冰块的柠檬气泡水，背景是木质桌面，整体光线明亮，给人夏日清爽的感觉。',
@@ -54,9 +61,27 @@ async function mockGenerate(formData: FormData): Promise<GenerationResponse> {
         body: '姐妹们谁懂啊！\n\n今天随手点的这杯柠檬气泡水真的戳中我了，冰块满满，酸度刚好，不齁甜。\n\n拍照的时候阳光刚好洒进来，原图就很有氛围感，完全不用加滤镜。\n\n夏天不想喝奶茶的时候来一杯这个，解腻又解渴，真的很爱～',
         tags: ['#夏日饮品', '#柠檬气泡水', '#清爽解腻', '#下午茶'],
         created_at: new Date().toISOString()
-      })
+      }
+      mockHistory.unshift(generated)
+      mockHistory.splice(50)
+      resolve(generated)
     }, 1500)
   })
+}
+
+async function readApiError(response: Response): Promise<GenerationError> {
+  let errorData: ApiErrorResponse | undefined
+  try {
+    errorData = (await response.json()) as ApiErrorResponse
+  } catch {
+    // 非 JSON 上游错误统一使用固定兜底信息。
+  }
+
+  return new GenerationError(
+    errorData?.error?.message || `请求失败（HTTP ${response.status}）`,
+    errorData?.error?.code || 'INTERNAL_ERROR',
+    errorData?.error?.retryable ?? false
+  )
 }
 
 /**
@@ -77,17 +102,7 @@ async function realGenerate(formData: FormData): Promise<GenerationResponse> {
     clearTimeout(timeoutId)
 
     if (!response.ok) {
-      let errorData: ApiErrorResponse | undefined
-      try {
-        errorData = (await response.json()) as ApiErrorResponse
-      } catch {
-        // 解析失败时兜底
-      }
-
-      const code = errorData?.error?.code || 'INTERNAL_ERROR'
-      const message = errorData?.error?.message || `请求失败（HTTP ${response.status}）`
-      const retryable = errorData?.error?.retryable ?? false
-      throw new GenerationError(message, code, retryable)
+      throw await readApiError(response)
     }
 
     return (await response.json()) as GenerationResponse
@@ -115,4 +130,55 @@ export async function generate(formData: FormData): Promise<GenerationResponse> 
     return mockGenerate(formData)
   }
   return realGenerate(formData)
+}
+
+async function realListGenerations(limit: number): Promise<GenerationHistoryResponse> {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), HISTORY_TIMEOUT)
+
+  try {
+    const response = await fetch(
+      `${API_BASE_URL}/api/v1/generations?limit=${encodeURIComponent(limit)}`,
+      {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        cache: 'no-store',
+        signal: controller.signal
+      }
+    )
+
+    if (!response.ok) {
+      throw await readApiError(response)
+    }
+
+    return (await response.json()) as GenerationHistoryResponse
+  } catch (err: any) {
+    if (err instanceof GenerationError) {
+      throw err
+    }
+
+    if (err.name === 'AbortError') {
+      throw new GenerationError('历史记录读取超时，请稍后重试', 'HISTORY_TIMEOUT', true)
+    }
+
+    throw new GenerationError('无法连接后端，请确认服务已启动', 'NETWORK_ERROR', true)
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+/**
+ * 读取最近成功生成的本地历史记录，不触发模型调用。
+ */
+export async function listGenerations(limit: number = 20): Promise<GenerationHistoryResponse> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+    throw new GenerationError('历史记录数量必须在 1 到 50 之间', 'INVALID_HISTORY_LIMIT', false)
+  }
+
+  if (USE_MOCK) {
+    const items = mockHistory.slice(0, limit)
+    return { items, count: items.length }
+  }
+
+  return realListGenerations(limit)
 }
