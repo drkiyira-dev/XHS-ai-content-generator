@@ -25,12 +25,32 @@ const form = reactive({
 // ===== 图片相关 =====
 const imageFile = ref<File | null>(null)
 const imagePreviewUrl = ref('')
+const imageIsHeif = ref(false)
 const uploadRef = ref<UploadInstance>()
 
 // 常量配置
+type SupportedImageFormat = 'JPEG' | 'PNG' | 'WEBP' | 'HEIF'
 const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
-const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp']
-const ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp']
+const HEADER_BYTES = 256
+const FORMAT_BY_MIME: Record<string, SupportedImageFormat> = {
+  'image/jpeg': 'JPEG',
+  'image/png': 'PNG',
+  'image/webp': 'WEBP',
+  'image/heic': 'HEIF',
+  'image/heif': 'HEIF'
+}
+const FORMAT_BY_EXTENSION: Record<string, SupportedImageFormat> = {
+  '.jpg': 'JPEG',
+  '.jpeg': 'JPEG',
+  '.png': 'PNG',
+  '.webp': 'WEBP',
+  '.heic': 'HEIF',
+  '.heif': 'HEIF'
+}
+const ALLOWED_TYPES = Object.keys(FORMAT_BY_MIME)
+const ALLOWED_EXTENSIONS = Object.keys(FORMAT_BY_EXTENSION)
+const HEIF_SINGLE_IMAGE_MAJOR_BRANDS = new Set(['heic', 'heix', 'heim', 'heis', 'mif1'])
+const HEIF_REJECTED_BRANDS = new Set(['avif', 'avis', 'hevc', 'hevx', 'hevm', 'hevs', 'msf1'])
 
 // 检查文件扩展名是否合法
 function isValidExtension(filename: string): boolean {
@@ -38,19 +58,59 @@ function isValidExtension(filename: string): boolean {
   return ALLOWED_EXTENSIONS.some(ext => lower.endsWith(ext))
 }
 
+function formatFromExtension(filename: string): SupportedImageFormat | undefined {
+  const lower = filename.toLowerCase()
+  const extension = ALLOWED_EXTENSIONS.find(ext => lower.endsWith(ext))
+  return extension ? FORMAT_BY_EXTENSION[extension] : undefined
+}
+
 // 检查 MIME 类型是否合法（防止改扩展名）
 function isValidMimeType(type: string): boolean {
   return ALLOWED_TYPES.includes(type)
 }
 
+function readBrand(bytes: Uint8Array, offset: number): string {
+  if (offset < 0 || offset + 4 > bytes.length) {
+    return ''
+  }
+  return String.fromCharCode(
+    bytes[offset],
+    bytes[offset + 1],
+    bytes[offset + 2],
+    bytes[offset + 3]
+  )
+}
+
+// 与后端保持同一组有界品牌规则：接受单图 HEIF，拒绝 AVIF 与序列品牌。
+function isSingleImageHeifHeader(bytes: Uint8Array): boolean {
+  if (bytes.length < 16 || readBrand(bytes, 4) !== 'ftyp') {
+    return false
+  }
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const boxSize = view.getUint32(0, false)
+  if (boxSize < 16 || boxSize > bytes.length || boxSize % 4 !== 0) {
+    return false
+  }
+
+  const majorBrand = readBrand(bytes, 8)
+  const allBrands = new Set([majorBrand])
+  for (let offset = 16; offset < boxSize; offset += 4) {
+    allBrands.add(readBrand(bytes, offset))
+  }
+
+  return HEIF_SINGLE_IMAGE_MAJOR_BRANDS.has(majorBrand) &&
+    !Array.from(allBrands).some(brand => HEIF_REJECTED_BRANDS.has(brand))
+}
+
 // 读取文件头并校验是否为真实图片
-function validateImageHeader(file: File): Promise<boolean> {
+function detectImageFormat(file: File): Promise<SupportedImageFormat | null> {
   return new Promise((resolve) => {
     const reader = new FileReader()
     reader.onload = (e) => {
       const buffer = e.target?.result as ArrayBuffer
       if (!buffer || buffer.byteLength < 12) {
-        resolve(false)
+        resolve(null)
         return
       }
       const bytes = new Uint8Array(buffer)
@@ -67,10 +127,16 @@ function validateImageHeader(file: File): Promise<boolean> {
       const isWebp = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
                      bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
 
-      resolve(isJpeg || isPng || isWebp)
+      const isHeif = isSingleImageHeifHeader(bytes)
+
+      if (isJpeg) resolve('JPEG')
+      else if (isPng) resolve('PNG')
+      else if (isWebp) resolve('WEBP')
+      else if (isHeif) resolve('HEIF')
+      else resolve(null)
     }
-    reader.onerror = () => resolve(false)
-    reader.readAsArrayBuffer(file.slice(0, 12))
+    reader.onerror = () => resolve(null)
+    reader.readAsArrayBuffer(file.slice(0, HEADER_BYTES))
   })
 }
 
@@ -86,7 +152,7 @@ async function handleImageChange(file: any) {
 
   // 1. 校验文件扩展名
   if (!isValidExtension(raw.name)) {
-    ElMessage.error('仅支持 JPG / JPEG / PNG / WebP 格式的图片')
+    ElMessage.error('仅支持 JPG / JPEG / PNG / WebP / HEIC / HEIF 格式的图片')
     clearImage()
     return
   }
@@ -94,6 +160,14 @@ async function handleImageChange(file: any) {
   // 2. 校验 MIME 类型
   if (!isValidMimeType(raw.type)) {
     ElMessage.error('文件类型不正确，请上传真实的图片文件')
+    clearImage()
+    return
+  }
+
+  const extensionFormat = formatFromExtension(raw.name)
+  const mimeFormat = FORMAT_BY_MIME[raw.type]
+  if (!extensionFormat || extensionFormat !== mimeFormat) {
+    ElMessage.error('图片扩展名与 MIME 类型不一致')
     clearImage()
     return
   }
@@ -106,8 +180,8 @@ async function handleImageChange(file: any) {
   }
 
   // 4. 校验文件头（防止改扩展名）
-  const isRealImage = await validateImageHeader(raw)
-  if (!isRealImage) {
+  const detectedFormat = await detectImageFormat(raw)
+  if (!detectedFormat || detectedFormat !== extensionFormat) {
     ElMessage.error('文件内容不是真实图片，请勿修改扩展名后上传')
     clearImage()
     return
@@ -115,6 +189,7 @@ async function handleImageChange(file: any) {
 
   // 通过校验，保存图片
   imageFile.value = raw
+  imageIsHeif.value = detectedFormat === 'HEIF'
   imagePreviewUrl.value = URL.createObjectURL(raw)
   ElMessage.success('图片上传成功')
 }
@@ -124,6 +199,7 @@ function clearImage() {
   // 同步清空 el-upload 的内部队列，避免 limit=1 阻止再次选择。
   uploadRef.value?.clearFiles()
   imageFile.value = null
+  imageIsHeif.value = false
   if (imagePreviewUrl.value) {
     URL.revokeObjectURL(imagePreviewUrl.value)
     imagePreviewUrl.value = ''
@@ -170,7 +246,7 @@ async function handleGenerate() {
     formData.append('tone', form.tone.trim())
   }
 
-  // 4. 调用 service 层（当前是 Mock，后续切换真实接口不用改这里）
+  // 4. 调用 service 层（默认真实接口；仅显式 VITE_USE_MOCK=true 时使用 Mock）
   try {
     const data = await generate(formData)
     Object.assign(result, data)
@@ -214,7 +290,7 @@ function copyAll() {
           drag
           action="#"
           :auto-upload="false"
-          accept=".jpg,.jpeg,.png,.webp"
+          accept=".jpg,.jpeg,.png,.webp,.heic,.heif"
           :on-change="handleImageChange"
           :limit="1"
           :show-file-list="false"
@@ -225,14 +301,23 @@ function copyAll() {
           </div>
           <template #tip>
             <div class="el-upload__tip">
-              仅支持 JPG / JPEG / PNG / WebP，最大 10MB
+              仅支持 JPG / JPEG / PNG / WebP / HEIC / HEIF，最大 10MB
             </div>
           </template>
         </el-upload>
 
         <!-- 图片预览 + 删除按钮 -->
         <div v-if="imagePreviewUrl" class="preview">
-          <img :src="imagePreviewUrl" alt="preview" />
+          <div
+            v-if="imageIsHeif"
+            class="heif-preview"
+            role="img"
+            aria-label="HEIC 或 HEIF 图片已选择"
+          >
+            <strong>{{ imageFile?.name }}</strong>
+            <span>浏览器不直接预览此格式，将由后端安全转换为 JPEG</span>
+          </div>
+          <img v-else :src="imagePreviewUrl" alt="preview" />
           <el-button
             class="delete-btn"
             type="danger"
@@ -389,6 +474,30 @@ function copyAll() {
   max-height: 300px;
   border-radius: 8px;
   border: 1px solid #e5e7eb;
+}
+
+.heif-preview {
+  box-sizing: border-box;
+  width: min(100%, 480px);
+  min-height: 160px;
+  padding: 24px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  color: #334155;
+}
+
+.heif-preview strong {
+  overflow-wrap: anywhere;
+}
+
+.heif-preview span {
+  color: #64748b;
+  font-size: 14px;
 }
 
 .delete-btn {
