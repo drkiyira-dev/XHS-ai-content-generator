@@ -3,7 +3,7 @@
 from contextlib import asynccontextmanager
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -132,5 +132,16 @@ def create_app(
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
+
+    @application.get(
+        "/api/health",
+        tags=["health"],
+        summary="Check API liveness",
+    )
+    async def health(response: Response) -> dict[str, str]:
+        """Report process liveness without contacting models or persistence."""
+        response.headers["Cache-Control"] = "no-store"
+        return {"status": "ok"}
+
     application.include_router(api_v1_router, prefix="/api/v1")
     return application

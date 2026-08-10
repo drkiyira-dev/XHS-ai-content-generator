@@ -69,3 +69,77 @@ jobs:
 
       - name: Build frontend
         run: npm run build
+
+  backend-container-smoke:
+    name: Backend container smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and verify backend container
+        env:
+          CI_DOCKER_IMAGE: xhs-ai-backend:ci
+          CI_DOCKER_CONTAINER: xhs-ai-backend-ci
+        run: |
+          set -euo pipefail
+
+          docker build --tag "$CI_DOCKER_IMAGE" .
+
+          runtime_user="$(docker image inspect \
+            --format '{{.Config.User}}' "$CI_DOCKER_IMAGE")"
+          if [ "$runtime_user" != "10001:10001" ]; then
+            echo "Container image must use the expected non-root runtime user."
+            exit 1
+          fi
+
+          cleanup() {
+            docker rm --force "$CI_DOCKER_CONTAINER" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run \
+            --detach \
+            --name "$CI_DOCKER_CONTAINER" \
+            --network none \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777 \
+            --tmpfs /run/xhs/uploads:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges=true \
+            --pids-limit 128 \
+            --memory 1g \
+            --health-interval 1s \
+            --health-timeout 2s \
+            --health-start-period 1s \
+            --health-retries 10 \
+            --env SILICONFLOW_API_KEY=ci-placeholder-not-a-secret \
+            --env SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1 \
+            --env VISION_MODEL_NAME=ci-vision-placeholder \
+            --env OCR_MODEL_NAME=ci-ocr-placeholder \
+            --env DATABASE_ENABLED=false \
+            "$CI_DOCKER_IMAGE"
+
+          ready=false
+          for attempt in $(seq 1 30); do
+            health_status="$(docker inspect \
+              --format '{{.State.Health.Status}}' \
+              "$CI_DOCKER_CONTAINER" 2>/dev/null || true)"
+            if [ "$health_status" = "healthy" ]; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" != true ]; then
+            docker logs "$CI_DOCKER_CONTAINER"
+            exit 1
+          fi
+
+          docker exec "$CI_DOCKER_CONTAINER" python -c \
+            'import json, urllib.request; response=urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=2); assert response.status == 200; assert json.load(response) == {"status": "ok"}'
