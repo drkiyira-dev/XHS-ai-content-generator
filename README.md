@@ -6,6 +6,7 @@
 
 - `POST /api/v1/generations`，使用 `multipart/form-data` 上传单张图片。
 - `GET /api/v1/generations`，读取最近成功生成的本地历史记录。
+- 首屏官网前台包含产品介绍、功能亮点、使用流程、FAQ 和工作台入口。
 - 前端可在生成工作台与历史记录页之间切换，支持历史加载、空状态、错误重试、刷新和单条复制。
 - 支持 JPG、JPEG、PNG、WebP，以及单帧 HEIC/HEIF；HEIC/HEIF 会在服务端安全转换为 JPEG，
   并拒绝空文件、伪装格式、损坏图片、超限文件和异常尺寸。
