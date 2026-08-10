@@ -1,5 +1,4 @@
 // 小红书文案生成接口服务层
-// 后续切换真实接口时，只需要把 USE_MOCK 改成 false
 
 export interface GenerationResponse {
   generation_id: string
@@ -18,8 +17,8 @@ export interface ApiErrorResponse {
   }
 }
 
-// TODO: B 后端上传后改为 false
-const USE_MOCK = true
+// 默认连接真实后端；仅在环境变量显式设为 true 时启用 Mock。
+const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
 const API_TIMEOUT = 90000 // 90 秒，模型调用可能较慢
