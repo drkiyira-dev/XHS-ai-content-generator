@@ -123,8 +123,67 @@ python -m uvicorn backend.main:app --reload
 
 - Swagger UI：<http://127.0.0.1:8000/docs>
 - OpenAPI JSON：<http://127.0.0.1:8000/openapi.json>
+- 健康检查：`GET http://127.0.0.1:8000/api/health`
 - 生成接口：`POST http://127.0.0.1:8000/api/v1/generations`
 - 历史接口：`GET http://127.0.0.1:8000/api/v1/generations?limit=20`
+
+健康检查只确认 FastAPI 进程能够响应，不会调用 OCR、Qwen 或查询数据库，也不会返回
+模型、数据库或环境变量详情。若显式启用了 MySQL，数据库启动检查仍会在应用进入可用状态
+前独立执行，失败时应用会终止启动。
+
+## 后端 Docker 镜像（增值功能）
+
+仓库根目录提供后端专用的多阶段 `Dockerfile`。镜像使用 Python 3.12 Debian slim，
+最终阶段固定以 UID/GID `10001:10001` 的非 root 用户运行，只复制后端代码与运行依赖。
+构建上下文采用白名单，不会把 `.env`、Git 历史、前端依赖、测试数据、上传图片或日志
+发送给 Docker 构建器。
+
+构建镜像：
+
+```bash
+docker build --tag xhs-ai-backend:local .
+```
+
+本段只容器化后端，不自动启动或修改 MySQL。先复制一份不会提交的容器配置，并确保其中
+至少填写真实 `SILICONFLOW_API_KEY`，同时保持 `DATABASE_ENABLED=false`：
+
+```bash
+cp .env.example .env.docker
+```
+
+使用只读根文件系统和专用 tmpfs 启动；上传原图、预处理图以及 Python 临时文件只存在于
+内存中，并会在容器停止后消失：
+
+```bash
+docker run --rm \
+  --name xhs-ai-backend \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777 \
+  --tmpfs /run/xhs/uploads:rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700 \
+  --cap-drop ALL \
+  --security-opt no-new-privileges=true \
+  --pids-limit 128 \
+  --publish 127.0.0.1:8000:8000 \
+  --env-file .env.docker \
+  --env UPLOAD_DIR=/run/xhs/uploads \
+  --env DATABASE_ENABLED=false \
+  xhs-ai-backend:local
+```
+
+浏览器继续访问 <http://127.0.0.1:8000/docs>；可用下面的命令单独验证容器内置健康检查：
+
+```bash
+docker inspect --format '{{.State.Health.Status}}' xhs-ai-backend
+```
+
+不要使用 Docker `ARG`、Dockerfile `ENV` 或镜像层传入真实 API Key；示例通过未跟踪的
+`.env.docker` 在运行时注入。镜像没有声明保存上传文件的 `VOLUME`，避免匿名卷残留图片。
+容器内部必须监听 `0.0.0.0` 才能接受端口映射，但宿主机只发布到 `127.0.0.1`，因为
+当前历史接口仍是无登录鉴权的本地单用户功能。
+
+`127.0.0.1` 在容器中指向容器自身，不是宿主机 MySQL。本段因此明确保持数据库关闭；
+数据库容器编排、专用网络、迁移执行和持久卷属于后续 Docker Compose 段，不能用临时
+主机映射绕过现有 MySQL/TLS 安全检查。
 
 ## API 请求
 
@@ -291,13 +350,16 @@ XHS_MYSQL_LIVE_TEST_CONFIRM=YES_USE_XHS_AI_TEST \
 - `develop` 或 `main` 收到新的提交。
 - 在 GitHub Actions 页面手动触发。
 
-CI 包含两个互相独立的任务：
+CI 包含三个互相独立的任务：
 
 - Python 3.12：安装后端开发依赖并运行全部 `pytest`。
 - Node.js 24：使用 `npm ci` 按锁文件安装前端依赖并执行生产构建。
+- Docker：构建后端镜像，以非 root、只读文件系统、无网络和无 Linux capabilities 的
+  容器执行 `/api/health` 冒烟检查；只使用无效占位 Key，不连接模型或 MySQL。
 
 该 workflow 只有仓库内容读取权限，不使用硅基流动 Key、不连接 MySQL、
-不部署应用，也不会自动修改或合并 PR。重复推送同一分支时，较旧的运行会被取消。
+不登录镜像仓库、不推送镜像、不部署应用，也不会自动修改或合并 PR。重复推送同一分支
+时，较旧的运行会被取消。
 
 ## 团队整合状态与后续工作
 

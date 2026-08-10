@@ -1,0 +1,6 @@
+**
+!pyproject.toml
+!backend/
+!backend/**/
+!backend/*.py
+!backend/**/*.py

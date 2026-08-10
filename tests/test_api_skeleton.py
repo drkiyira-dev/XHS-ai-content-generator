@@ -2,12 +2,39 @@
 
 import asyncio
 from datetime import datetime
+from unittest.mock import Mock
 from uuid import UUID
 
 import pytest
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from tests.support import build_test_app, make_image_bytes, send_request
+
+
+def test_health_endpoint_is_a_side_effect_free_liveness_check() -> None:
+    model_service = Mock()
+    generation_persistence = Mock()
+    application = build_test_app(
+        model_service=model_service,
+        generation_persistence=generation_persistence,
+    )
+
+    response = asyncio.run(
+        send_request("GET", "/api/health", application=application)
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert response.headers["cache-control"] == "no-store"
+    assert model_service.method_calls == []
+    assert generation_persistence.method_calls == []
+
+
+def test_health_endpoint_is_documented_in_openapi() -> None:
+    operation = build_test_app().openapi()["paths"]["/api/health"]["get"]
+
+    assert operation["summary"] == "Check API liveness"
+    assert operation["tags"] == ["health"]
 
 
 def test_generation_endpoint_accepts_frozen_multipart_contract() -> None:
