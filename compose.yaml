@@ -1,0 +1,109 @@
+name: xhs-ai-content-generator
+
+services:
+  mysql:
+    image: mysql:8.4.11
+    user: "999:999"
+    restart: unless-stopped
+    read_only: true
+    command:
+      - --bind-address=127.0.0.1
+      - --skip-name-resolve
+      - --local-infile=OFF
+      - --secure-file-priv=NULL
+      - --mysqlx=OFF
+    environment:
+      MYSQL_DATABASE: xhs_ai
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/MYSQL_ROOT_PASSWORD
+      MYSQL_ROOT_HOST: localhost
+      MYSQL_INITDB_SKIP_TZINFO: "1"
+    secrets:
+      - source: mysql_app_password
+        target: MYSQL_APP_PASSWORD
+      - source: mysql_root_password
+        target: MYSQL_ROOT_PASSWORD
+    volumes:
+      - type: volume
+        source: mysql_data
+        target: /var/lib/mysql
+      - type: bind
+        source: ./migrations/001_generation_records.sql
+        target: /docker-entrypoint-initdb.d/001_generation_records.sql
+        read_only: true
+      - type: bind
+        source: ./migrations/002_create_app_user.sh
+        target: /docker-entrypoint-initdb.d/002_create_app_user.sh
+        read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+      - /var/run/mysqld:rw,noexec,nosuid,nodev,size=16m,uid=999,gid=999,mode=0750
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges=true
+    pids_limit: 256
+    healthcheck:
+      test:
+        - CMD
+        - mysqladmin
+        - ping
+        - --host=127.0.0.1
+        - --silent
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - runtime
+    stop_grace_period: 30s
+
+  backend:
+    image: xhs-ai-backend:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "10001:10001"
+    restart: unless-stopped
+    read_only: true
+    init: true
+    network_mode: service:mysql
+    depends_on:
+      mysql:
+        condition: service_healthy
+        restart: true
+    environment:
+      DATABASE_ENABLED: "true"
+      UPLOAD_DIR: /run/xhs/uploads
+    secrets:
+      - source: siliconflow_api_key
+        target: SILICONFLOW_API_KEY
+      - source: database_url
+        target: DATABASE_URL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+      - /run/xhs/uploads:rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges=true
+    pids_limit: 128
+    stop_grace_period: 30s
+
+secrets:
+  siliconflow_api_key:
+    file: ./.compose-secrets/SILICONFLOW_API_KEY
+  database_url:
+    file: ./.compose-secrets/DATABASE_URL
+  mysql_app_password:
+    file: ./.compose-secrets/MYSQL_APP_PASSWORD
+  mysql_root_password:
+    file: ./.compose-secrets/MYSQL_ROOT_PASSWORD
+
+networks:
+  runtime:
+    driver: bridge
+
+volumes:
+  mysql_data:

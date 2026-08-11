@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = PROJECT_ROOT / ".env"
+RUNTIME_SECRETS_DIR = Path("/run/secrets")
 
 
 class Settings(BaseSettings):
@@ -278,4 +279,5 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     """Load settings once per process after the environment is configured."""
-    return Settings()
+    secrets_dir = RUNTIME_SECRETS_DIR if RUNTIME_SECRETS_DIR.is_dir() else None
+    return Settings(_secrets_dir=secrets_dir)

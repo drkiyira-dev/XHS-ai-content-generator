@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from backend.core.config import ENV_FILE, PROJECT_ROOT, Settings, get_settings
+import backend.core.config as config_module
+from backend.core.config import (
+    ENV_FILE,
+    PROJECT_ROOT,
+    RUNTIME_SECRETS_DIR,
+    Settings,
+    get_settings,
+)
 from backend.services.persistence.runtime import (
     DatabaseStartupError,
     create_sqlalchemy_persistence_runtime,
@@ -296,6 +303,48 @@ def test_get_settings_returns_one_immutable_instance(
         assert second.vision_model_name == "qwen-test-model"
     finally:
         get_settings.cache_clear()
+
+
+def test_get_settings_loads_container_secret_files_without_exposing_them(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    set_required_environment(monkeypatch)
+    monkeypatch.delenv("SILICONFLOW_API_KEY")
+    monkeypatch.delenv("DATABASE_URL")
+    monkeypatch.setenv("DATABASE_ENABLED", "true")
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    secret_api_key = "container-provider-secret"
+    secret_database_url = (
+        "mysql+pymysql://xhs_app:container-db-secret@"
+        "127.0.0.1:3306/xhs_ai"
+    )
+    (tmp_path / "SILICONFLOW_API_KEY").write_text(
+        secret_api_key,
+        encoding="utf-8",
+    )
+    (tmp_path / "DATABASE_URL").write_text(
+        secret_database_url,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "RUNTIME_SECRETS_DIR", tmp_path)
+    get_settings.cache_clear()
+
+    try:
+        settings = get_settings()
+
+        assert settings.siliconflow_api_key.get_secret_value() == secret_api_key
+        assert settings.database_url is not None
+        assert settings.database_url.get_secret_value() == secret_database_url
+        assert secret_api_key not in repr(settings)
+        assert "container-db-secret" not in repr(settings)
+    finally:
+        get_settings.cache_clear()
+
+
+def test_runtime_secrets_directory_is_outside_the_project() -> None:
+    assert RUNTIME_SECRETS_DIR == Path("/run/secrets")
+    assert PROJECT_ROOT not in RUNTIME_SECRETS_DIR.parents
 
 
 def test_normalizes_model_name_and_upload_directory(

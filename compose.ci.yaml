@@ -1,0 +1,10 @@
+services:
+  mysql:
+    restart: "no"
+
+  backend:
+    restart: "no"
+
+networks:
+  runtime:
+    internal: true
