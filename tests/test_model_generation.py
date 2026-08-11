@@ -29,9 +29,16 @@ from backend.services.model.ocr import (
 from backend.services.model.qwen import (
     ModelOutputError,
     _build_image_data_url,
+    _normalize_tone_for_prompt,
     parse_generated_copy,
 )
-from backend.services.model.safety import find_unsupported_claim_rule
+from backend.services.model.safety import (
+    build_local_evidence_fallback,
+    can_apply_local_evidence_fallback,
+    claim_rule_diagnostic_label,
+    find_strict_unsupported_claim_rule,
+    find_unsupported_claim_rule,
+)
 from backend.services.model.types import GENERATED_TITLE_MAX_LENGTH
 from tests.support import build_test_app, make_image_bytes, send_request
 
@@ -92,6 +99,16 @@ WRONG_CATEGORY_CONTENT = json.dumps(
         "title": "浅粉色身体乳",
         "body": "这瓶植物精油身体乳采用浅粉色包装和简约标签。",
         "tags": ["#身体乳", "#粉色包装", "#产品分享"],
+    },
+    ensure_ascii=False,
+)
+
+OBFUSCATED_MEDICAL_CONTENT = json.dumps(
+    {
+        "image_summary": "图片中可见湖泊、树林和群山倒影。",
+        "title": "湖畔风景记录",
+        "body": "远处群山层叠。具有治。疗作用。",
+        "tags": ["#湖景", "#旅行记录", "#自然风光"],
     },
     ensure_ascii=False,
 )
@@ -882,7 +899,7 @@ def test_cancellation_during_safety_rewrite_drops_first_output(
             nonlocal calls
             calls += 1
             if calls == 1:
-                return completion_response(UNSAFE_SKINCARE_CONTENT)
+                return completion_response(OBFUSCATED_MEDICAL_CONTENT)
             rewrite_started.set()
             await asyncio.Event().wait()
             return completion_response(SAFE_SKINCARE_CONTENT)
@@ -921,8 +938,7 @@ def test_cancellation_during_safety_rewrite_drops_first_output(
     assert captured.__context__ is None
     assert_sensitive_request_is_unreachable(
         captured,
-        "敏肌姐妹可以试试",
-        "用起来很安心",
+        "具有治。疗作用",
         private_product_name,
         private_ocr_text,
     )
@@ -964,8 +980,46 @@ def test_evidence_bound_skincare_copy_passes_claim_guard() -> None:
         ("洗后皮肤不紧绷。", ("#包装", "#分享", "#日常"), "skin_feel"),
         ("洗完不会觉得紧绷。", ("#包装", "#分享", "#日常"), "skin_feel"),
         ("洗完脸不会干。", ("#包装", "#分享", "#日常"), "skin_feel"),
+        (
+            "用起来感觉质地轻盈。",
+            ("#包装", "#分享", "#日常"),
+            "subjective_experience",
+        ),
+        (
+            "日常用着挺顺手的。",
+            ("#包装", "#分享", "#日常"),
+            "subjective_experience",
+        ),
+        (
+            "瓶身拿起来挺顺手。",
+            ("#包装", "#分享", "#日常"),
+            "subjective_experience",
+        ),
+        (
+            "瓶身拿在手里挺顺手。",
+            ("#包装", "#分享", "#日常"),
+            "subjective_experience",
+        ),
+        (
+            "包装上写着质地轻盈。",
+            ("#包装", "#分享", "#日常"),
+            "subjective_experience",
+        ),
+        (
+            "只描述可见包装。",
+            ("#包装", "#平价好物", "#日常"),
+            "price_claim",
+        ),
+        (
+            "价格很实惠，性价比高。",
+            ("#包装", "#分享", "#日常"),
+            "price_claim",
+        ),
         ("主打补水保湿。", ("#包装", "#分享", "#日常"), "cosmetic_efficacy"),
         ("功效经过临床验证。", ("#包装", "#分享", "#日常"), "medical_claim"),
+        ("湖光山色很疗愈。", ("#湖景", "#旅行", "#日常"), "medical_claim"),
+        ("具有抑菌抗菌疗效。", ("#包装", "#分享", "#日常"), "medical_claim"),
+        ("經過臨床驗證。", ("#包装", "#分享", "#日常"), "medical_claim"),
         ("能够深层清洁。", ("#包装", "#分享", "#日常"), "performance_claim"),
         ("采用无添加配方。", ("#包装", "#分享", "#日常"), "composition_claim"),
         ("日常用起来很安心。", ("#包装", "#分享", "#日常"), "unsupported_reassurance"),
@@ -995,6 +1049,9 @@ def test_claim_guard_returns_only_fixed_rule_identifiers(
     [
         "这款产品温\u200b和 不 刺 激。",
         "This product is ＮＯＮ－ＩＲＲＩＴＡＴＩＮＧ.",
+        "这款产品质 地 轻\u200b盈。",
+        "瓶身拿着挺\u200b顺 手。",
+        "妥妥的平　价 好 物。",
     ],
 )
 def test_claim_guard_normalizes_obfuscated_claims(body: str) -> None:
@@ -1009,6 +1066,22 @@ def test_claim_guard_normalizes_obfuscated_claims(body: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("rule", "expected"),
+    [
+        (None, "not_applicable"),
+        ("subjective_experience", "subjective_experience"),
+        ("price_claim", "price_claim"),
+        ("private-content\nforged-log-line", "unknown"),
+    ],
+)
+def test_claim_rule_diagnostic_label_never_echoes_unknown_values(
+    rule: str | None,
+    expected: str,
+) -> None:
+    assert claim_rule_diagnostic_label(rule) == expected
+
+
+@pytest.mark.parametrize(
     "body",
     [
         "温柔的粉调搭配简约标签。",
@@ -1020,6 +1093,16 @@ def test_claim_guard_normalizes_obfuscated_claims(body: str) -> None:
         "这款产品不适合敏感肌。",
         "针织衫采用紧致剪裁。",
         "纸巾好吸收。",
+        "瓶身呈浅粉色，标签设计简约。",
+        "轻盈的视觉配色搭配留白设计。",
+        "图片无法确认价格和性价比，请核对商品页。",
+        "图片无法确认这款产品是否补水保湿。",
+        "图片无法确认补水和保湿。",
+        "图片无法确认补水以及保湿。",
+        "建议先核对官方说明是否补水。",
+        "顺手记录了一张产品包装照。",
+        "标签上可见39元字样。",
+        "桌上放着一块提拉米苏。",
     ],
 )
 def test_claim_guard_allows_neutral_visual_or_cautionary_copy(body: str) -> None:
@@ -1033,6 +1116,285 @@ def test_claim_guard_allows_neutral_visual_or_cautionary_copy(body: str) -> None
     assert find_unsupported_claim_rule(generated_copy) is None
 
 
+@pytest.mark.parametrize(
+    ("tone", "expected"),
+    [
+        ("轻松治愈", "轻松、宁静、放松"),
+        ("轻松治 愈", "轻松、宁静、放松"),
+        ("療癒系", "轻松、宁静、放松"),
+        ("医生推荐风", "自然克制"),
+        ("简洁自然", "简洁自然"),
+        (None, None),
+    ],
+)
+def test_tone_medical_words_are_not_sent_as_style_evidence(
+    tone: str | None,
+    expected: str | None,
+) -> None:
+    assert _normalize_tone_for_prompt(tone) == expected
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_rule"),
+    [
+        ("图片无法确认价格却能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格也能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格并且能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格事实上能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格而且能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格随后能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格还能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格又能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格甚至能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格其实能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格最终能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格依旧能美白。", "cosmetic_efficacy"),
+        ("图片无法确认价格并能美白。", "cosmetic_efficacy"),
+        ("图片无法确认补水也能美白。", "cosmetic_efficacy"),
+        ("不能证实价格，同时具有治疗作用。", "medical_claim"),
+    ],
+)
+def test_claim_guard_does_not_extend_disclaimer_to_later_assertion(
+    body: str,
+    expected_rule: str,
+) -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="图片中可见浅色包装。",
+        title="包装观察",
+        body=body,
+        tags=("#包装", "#分享", "#日常"),
+    )
+
+    assert find_unsupported_claim_rule(generated_copy) == expected_rule
+
+
+def test_final_acceptance_subjective_copy_is_rejected() -> None:
+    generated_copy = GeneratedCopy(
+        image_summary=(
+            "一瓶粉色瓶身的卸妆油，标签显示品牌为THE SKIN THEORY，"
+            "产品名为CLEANSING OIL ROSE HIP，容量100ml。"
+        ),
+        title="THE SKIN THEORY玫瑰果卸妆",
+        body=(
+            "瓶身是温柔的粉色，设计很简约。标签上写着100ml，"
+            "用起来感觉质地轻盈，日常用着挺顺手的。"
+        ),
+        tags=("#卸妆油", "#玫瑰果", "#护肤日常", "#平价好物"),
+    )
+
+    assert find_unsupported_claim_rule(generated_copy) == "subjective_experience"
+
+
+def test_local_evidence_fallback_preserves_only_visible_facts() -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="图片中可见粉色瓶身，标签上写有100 ML。",
+        title="粉色瓶身包装",
+        body=(
+            "瓶身设计简约，奶油般丝滑的质地，"
+            "拿起来超级顺手，标签上可见39元字样。"
+        ),
+        tags=("#粉色瓶身", "#100ML", "#平价好物"),
+    )
+
+    result = build_local_evidence_fallback(generated_copy)
+
+    assert result.image_summary == "图片中可见粉色瓶身。标签上写有100 ML"
+    assert result.title == "粉色瓶身包装"
+    assert result.body == "瓶身设计简约。标签上可见39元字样"
+    assert result.tags == ("#粉色瓶身", "#100ML", "#图片记录")
+    assert find_unsupported_claim_rule(result) is None
+
+
+@pytest.mark.parametrize(
+    ("rule", "expected"),
+    [
+        ("subjective_experience", True),
+        ("price_claim", True),
+        ("medical_claim", True),
+        ("skin_tolerance", True),
+        ("cosmetic_efficacy", True),
+        ("sensitive_skin_tag", True),
+        ("product_category_conflict", False),
+        ("private-unknown-rule", False),
+        (None, False),
+    ],
+)
+def test_local_evidence_fallback_accepts_only_fixed_claim_rules(
+    rule: str | None,
+    expected: bool,
+) -> None:
+    assert can_apply_local_evidence_fallback(rule) is expected
+
+
+def test_local_evidence_fallback_uses_neutral_schema_safe_defaults() -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="质地轻盈。",
+        title="平价好物",
+        body="拿起来很顺手。",
+        tags=("#平价好物", "#白菜价", "#高性价比"),
+    )
+
+    result = build_local_evidence_fallback(generated_copy)
+
+    assert result == GeneratedCopy(
+        image_summary="图片中可见上传内容中的主体。",
+        title="图片内容观察",
+        body="仅记录图片可见内容，其他属性无法从图片确认。",
+        tags=("#图片记录", "#图文分享", "#内容分享"),
+    )
+    assert find_unsupported_claim_rule(result) is None
+
+
+def test_local_evidence_fallback_removes_all_claim_sentences_and_tags() -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="图片中可见湖泊、树林和群山。",
+        title="疗愈系天然湖景",
+        body=(
+            "湖面倒映着树林。户外活动记得及时补水。"
+            "这里是纯天然风光。画面还能治愈焦虑。"
+        ),
+        tags=("#湖景", "#敏感肌可用", "#敏感/肌", "#治愈系旅行"),
+    )
+
+    result = build_local_evidence_fallback(generated_copy)
+
+    assert result.image_summary == "图片中可见湖泊、树林和群山"
+    assert result.title == "图片内容观察"
+    assert result.body == "湖面倒映着树林"
+    assert result.tags == ("#湖景", "#图片记录", "#图文分享")
+    assert find_unsupported_claim_rule(result) is None
+    assert find_strict_unsupported_claim_rule(result) is None
+
+
+@pytest.mark.parametrize(
+    "medical_claim",
+    [
+        "能够治愈感冒",
+        "能够治愈系统性疾病",
+        "可以治疗痘痘",
+        "具有消炎杀菌作用",
+        "經過臨床驗證並由醫生推薦",
+    ],
+)
+def test_local_evidence_fallback_never_returns_medical_claim_text(
+    medical_claim: str,
+) -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="图片中可见湖泊和树林。",
+        title="湖景记录",
+        body=f"湖面倒映树林。{medical_claim}。远处可见群山。",
+        tags=("#湖景", "#旅行记录", "#自然风光"),
+    )
+
+    result = build_local_evidence_fallback(generated_copy)
+
+    assert result.body == "湖面倒映树林。远处可见群山"
+    assert medical_claim not in result.body
+    assert find_unsupported_claim_rule(result) is None
+    assert find_strict_unsupported_claim_rule(result) is None
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_rule"),
+    [
+        ("依然能美，白。", "cosmetic_efficacy"),
+        ("具有治。疗作用。", "medical_claim"),
+        ("适合敏感，肌。", "skin_suitability"),
+        ("这款产品美，白。", "cosmetic_efficacy"),
+        ("这个产品治。疗。", "medical_claim"),
+        ("这款产品适合敏感，肌。", "skin_suitability"),
+        ("这款敏感，肌可用。", "skin_suitability"),
+        ("儿童，适合使用这款产品。", "skin_suitability"),
+        ("孕妇，可以用这款产品。", "skin_suitability"),
+        ("能美✨白。", "cosmetic_efficacy"),
+        ("能美/白。", "cosmetic_efficacy"),
+    ],
+)
+def test_strict_fallback_guard_rejects_symbol_obfuscated_claims(
+    body: str,
+    expected_rule: str,
+) -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="图片中可见粉色瓶身。",
+        title="包装观察",
+        body=body,
+        tags=("#包装", "#分享", "#日常"),
+    )
+
+    assert find_unsupported_claim_rule(generated_copy) is None
+    assert (
+        find_strict_unsupported_claim_rule(generated_copy) == expected_rule
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "图片无法确认治疗作用。",
+        "不能证实是否治愈，请核对官方说明。",
+        "皮肤。外套剪裁紧致。",
+        "桌上放着一块提拉米苏。",
+        "画面很美。白色云朵倒映湖面。",
+        "画面很美，白云倒映湖面。",
+        "这里很美！白雪覆盖群山。",
+        "这里记录历史上的统治。疗养院位于远处。",
+        "沿途有人反抗。老人站在路边。",
+        "公园里有儿童。适合拍照的角度很多。",
+        "画面中有一名孕妇。适合散步的步道沿湖延伸。",
+        "远处有儿童。可用的桌椅摆在树下。",
+        "湖边可见婴幼儿。适合家庭记录的画面。",
+        "公园里有儿童。适合使用的桌椅摆在树下。",
+        "画面中有一名孕妇。可以用的长椅在步道旁。",
+    ],
+)
+def test_strict_guard_preserves_disclaimers_and_sentence_boundaries(
+    body: str,
+) -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="图片中可见湖泊和树林。",
+        title="画面记录",
+        body=body,
+        tags=("#图片记录", "#图文分享", "#日常"),
+    )
+
+    assert find_strict_unsupported_claim_rule(generated_copy) is None
+
+
+def test_strict_guard_does_not_extend_disclaimer_across_sentence() -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="图片中可见浅色包装。",
+        title="包装记录",
+        body="无法确认补水。美，白。",
+        tags=("#图片记录", "#图文分享", "#日常"),
+    )
+
+    assert (
+        find_strict_unsupported_claim_rule(generated_copy)
+        == "cosmetic_efficacy"
+    )
+
+
+@pytest.mark.parametrize(
+    "tag",
+    ["#敏感，肌护肤", "#护肤敏感，肌"],
+)
+def test_strict_guard_treats_obfuscated_sensitive_skin_tags_as_claims(
+    tag: str,
+) -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="图片中可见浅色包装。",
+        title="包装记录",
+        body="仅描述图片可见内容。",
+        tags=(tag, "#图片记录", "#日常"),
+    )
+
+    assert (
+        find_strict_unsupported_claim_rule(generated_copy)
+        == "sensitive_skin_tag"
+    )
+    assert tag not in build_local_evidence_fallback(generated_copy).tags
+
+
 def test_claim_guard_rejects_product_category_that_conflicts_with_ocr() -> None:
     generated_copy = parse_generated_copy(WRONG_CATEGORY_CONTENT)
 
@@ -1040,6 +1402,99 @@ def test_claim_guard_rejects_product_category_that_conflicts_with_ocr() -> None:
         generated_copy,
         ocr_text="THE SKIN THEORY\nCLEANSING OIL\nROSE HIP\n100 ML",
     ) == "product_category_conflict"
+
+
+@pytest.mark.parametrize(
+    ("body", "tags", "expected_rule"),
+    [
+        (
+            "标签显示产品是身，体乳。",
+            ("#包装", "#分享", "#日常"),
+            "product_category_conflict",
+        ),
+        (
+            "标签显示产品是BODY/LOTION。",
+            ("#包装", "#分享", "#日常"),
+            "product_category_conflict",
+        ),
+        (
+            "只描述图片可见内容。",
+            ("#身，体乳", "#分享", "#日常"),
+            "product_category_conflict",
+        ),
+        (
+            "只描述图片可见内容。",
+            ("#植物身，体乳", "#分享", "#日常"),
+            "product_category_conflict",
+        ),
+        (
+            "图片中可见身，体乳。",
+            ("#包装", "#分享", "#日常"),
+            "product_category_conflict",
+        ),
+        (
+            "远处有人健身。体乳液没有出现在图片里。",
+            ("#包装", "#分享", "#日常"),
+            None,
+        ),
+    ],
+)
+def test_strict_ocr_category_guard_requires_real_category_context(
+    body: str,
+    tags: tuple[str, ...],
+    expected_rule: str | None,
+) -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="图片中可见一瓶卸妆油。",
+        title="卸妆油包装",
+        body=body,
+        tags=tags,
+    )
+
+    assert find_strict_unsupported_claim_rule(
+        generated_copy,
+        ocr_text="CLEANSING OIL",
+    ) == expected_rule
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "标签未显示为身体乳。",
+        "标签未显示为身，体乳。",
+        "包装未标注为身体乳。",
+        "包装未标注为身，体乳。",
+        "图片中没有显示为身体乳。",
+        "图片中没有标注为身，体乳。",
+        "图片中没有看到身体乳。",
+        "图片中没有看到身，体乳。",
+        "包装未展示身体乳。",
+        "包装未展示身，体乳。",
+        "标签并非显示为身体乳。",
+        "标签并非显示为身，体乳。",
+        "包装不是标注为身体乳。",
+        "包装不是标注为身，体乳。",
+    ],
+)
+def test_ocr_category_guards_respect_explicit_category_negation(
+    body: str,
+) -> None:
+    generated_copy = GeneratedCopy(
+        image_summary="图片中可见一瓶卸妆油。",
+        title="卸妆油包装",
+        body=body,
+        tags=("#包装", "#分享", "#日常"),
+    )
+    ocr_text = "CLEANSING OIL"
+
+    assert find_unsupported_claim_rule(
+        generated_copy,
+        ocr_text=ocr_text,
+    ) is None
+    assert find_strict_unsupported_claim_rule(
+        generated_copy,
+        ocr_text=ocr_text,
+    ) is None
 
 
 def test_claim_guard_does_not_treat_user_guess_as_ocr_evidence() -> None:
@@ -1262,8 +1717,9 @@ def test_shortened_title_still_passes_through_claim_guard(
 
     result = asyncio.run(run())
 
-    assert result.title == "夏日轻装出发"
-    assert call_count == 2
+    assert result.title == "图片内容观察"
+    assert result.body == "只描述图片中可见的包装信息"
+    assert call_count == 1
 
 
 @pytest.mark.parametrize(
@@ -1363,7 +1819,7 @@ def test_unsupported_claim_is_rewritten_once_without_replaying_output(
         payload = json.loads(request.content)
         prompts.append(payload["messages"][1]["content"][1]["text"])
         if len(prompts) == 1:
-            return completion_response(UNSAFE_SKINCARE_CONTENT)
+            return completion_response(OBFUSCATED_MEDICAL_CONTENT)
         return completion_response(SAFE_SKINCARE_CONTENT)
 
     async def run() -> GeneratedCopy:
@@ -1395,8 +1851,329 @@ def test_unsupported_claim_is_rewritten_once_without_replaying_output(
     assert "精致小巧" in prompts[0]
     assert "上一次输出包含图片无法证实" in prompts[1]
     assert "最后一次尝试" in prompts[1]
-    assert "最近入手的THE SKIN THEORY" not in prompts[1]
-    assert "敏肌姐妹可以试试" not in prompts[1]
+    assert "具有治。疗作用" not in prompts[1]
+
+
+def test_subjective_and_price_claims_are_removed_without_second_call(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    image = make_processed_image(tmp_path)
+    prompts: list[str] = []
+    unsafe_content = json.dumps(
+        {
+            "image_summary": "图片中可见粉色瓶身和100 ML标签。",
+            "title": "粉色瓶身包装",
+            "body": "瓶身设计简约，奶油般丝滑的质地，拿起来超级顺手。",
+            "tags": ["#粉色瓶身", "#100ML", "#白菜价"],
+        },
+        ensure_ascii=False,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        prompts.append(payload["messages"][1]["content"][1]["text"])
+        if len(prompts) == 1:
+            return completion_response(unsafe_content)
+        return completion_response(SAFE_SKINCARE_CONTENT)
+
+    async def run() -> GeneratedCopy:
+        settings = make_settings()
+        client = SiliconFlowClient(
+            settings,
+            transport=httpx.MockTransport(handler),
+        )
+        service = QwenGenerationService(settings, client)
+        try:
+            return await service.generate(
+                image,
+                product_name="玫瑰果卸妆油",
+                target_audience="大学生",
+                tone="简洁自然",
+            )
+        finally:
+            await service.aclose()
+
+    caplog.set_level("WARNING")
+    result = asyncio.run(run())
+
+    assert result == build_local_evidence_fallback(
+        parse_generated_copy(unsafe_content)
+    )
+    assert len(prompts) == 1
+    assert "reason=unsupported_claim" in caplog.text
+    assert "rule=subjective_experience" in caplog.text
+    assert "奶油般丝滑的质地" not in caplog.text
+    assert "超级顺手" not in caplog.text
+    assert "#白菜价" not in caplog.text
+
+
+def test_first_subjective_output_uses_local_fallback_without_second_call(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    image = make_processed_image(tmp_path)
+    call_count = 0
+    unsafe_content = json.dumps(
+        {
+            "image_summary": "图片中可见粉色瓶身和100 ML标签。",
+            "title": "粉色瓶身包装",
+            "body": "瓶身设计简约，奶油般丝滑的质地，拿起来超级顺手。",
+            "tags": ["#粉色瓶身", "#100ML", "#白菜价"],
+        },
+        ensure_ascii=False,
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return completion_response(unsafe_content)
+
+    async def run() -> GeneratedCopy:
+        settings = make_settings()
+        client = SiliconFlowClient(
+            settings,
+            transport=httpx.MockTransport(handler),
+        )
+        service = QwenGenerationService(settings, client)
+        try:
+            return await service.generate(
+                image,
+                product_name="玫瑰果卸妆油",
+                target_audience="大学生",
+                tone="简洁自然",
+            )
+        finally:
+            await service.aclose()
+
+    caplog.set_level("WARNING")
+    result = asyncio.run(run())
+
+    assert call_count == 1
+    assert result.image_summary == "图片中可见粉色瓶身和100 ML标签"
+    assert result.title == "粉色瓶身包装"
+    assert result.body == "瓶身设计简约"
+    assert result.tags == ("#粉色瓶身", "#100ML", "#图片记录")
+    assert find_unsupported_claim_rule(result) is None
+    assert "Local evidence fallback applied rule=subjective_experience" in caplog.text
+    assert "奶油般丝滑的质地" not in caplog.text
+    assert "超级顺手" not in caplog.text
+    assert "#白菜价" not in caplog.text
+
+
+def test_scenic_healing_copy_is_safely_removed_in_one_call(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    image = make_processed_image(tmp_path)
+    prompts: list[str] = []
+    scenic_content = json.dumps(
+        {
+            "image_summary": "图片中可见湖泊、树林和群山倒影。",
+            "title": "治愈系湖光",
+            "body": "湖面倒映群山，画面很疗愈，远处可见树林。",
+            "tags": ["#湖景", "#治愈系风景", "#旅行记录"],
+        },
+        ensure_ascii=False,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        prompts.append(payload["messages"][1]["content"][1]["text"])
+        return completion_response(scenic_content)
+
+    async def run() -> GeneratedCopy:
+        settings = make_settings()
+        client = SiliconFlowClient(
+            settings,
+            transport=httpx.MockTransport(handler),
+        )
+        service = QwenGenerationService(settings, client)
+        try:
+            return await service.generate(
+                image,
+                product_name=None,
+                target_audience="户外爱好者",
+                tone="轻松治愈",
+            )
+        finally:
+            await service.aclose()
+
+    caplog.set_level("WARNING")
+    result = asyncio.run(run())
+
+    assert len(prompts) == 1
+    assert '"tone": "轻松、宁静、放松"' in prompts[0]
+    assert '"tone": "轻松治愈"' not in prompts[0]
+    assert result == GeneratedCopy(
+        image_summary="图片中可见湖泊、树林和群山倒影",
+        title="图片内容观察",
+        body="湖面倒映群山。远处可见树林",
+        tags=("#湖景", "#旅行记录", "#图片记录"),
+    )
+    assert find_unsupported_claim_rule(result) is None
+    assert find_strict_unsupported_claim_rule(result) is None
+    assert "Local evidence fallback applied rule=medical_claim" in caplog.text
+    assert "画面很疗愈" not in caplog.text
+
+
+def test_local_fallback_removes_mixed_claim_rules_without_second_call(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    image = make_processed_image(tmp_path)
+    call_count = 0
+    mixed_content = json.dumps(
+        {
+            "image_summary": "图片中可见粉色瓶身和100 ML标签。",
+            "title": "粉色瓶身包装",
+            "body": "质地轻盈，图片无法确认价格却能美白，具有治疗作用。",
+            "tags": ["#粉色瓶身", "#100ML", "#产品分享"],
+        },
+        ensure_ascii=False,
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return completion_response(mixed_content)
+
+    async def run() -> GeneratedCopy:
+        settings = make_settings()
+        client = SiliconFlowClient(
+            settings,
+            transport=httpx.MockTransport(handler),
+        )
+        service = QwenGenerationService(settings, client)
+        try:
+            return await service.generate(
+                image,
+                product_name=None,
+                target_audience=None,
+                tone=None,
+            )
+        finally:
+            await service.aclose()
+
+    caplog.set_level("WARNING")
+    result = asyncio.run(run())
+
+    assert call_count == 1
+    assert result.body == "仅记录图片可见内容，其他属性无法从图片确认。"
+    assert find_unsupported_claim_rule(result) is None
+    assert find_strict_unsupported_claim_rule(result) is None
+    assert "Local evidence fallback applied rule=subjective_experience" in caplog.text
+    assert "质地轻盈" not in caplog.text
+    assert "能美白" not in caplog.text
+    assert "治疗作用" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("obfuscated_claim", "expected_rule"),
+    [
+        ("依然能美，白", "cosmetic_efficacy"),
+        ("具有治。疗作用", "medical_claim"),
+        ("适合敏感，肌", "skin_suitability"),
+    ],
+)
+def test_local_fallback_rejects_obfuscated_claim_without_third_call(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    obfuscated_claim: str,
+    expected_rule: str,
+) -> None:
+    image = make_processed_image(tmp_path)
+    call_count = 0
+    mixed_content = json.dumps(
+        {
+            "image_summary": "图片中可见粉色瓶身和100 ML标签。",
+            "title": "粉色瓶身包装",
+            "body": f"质地轻盈。{obfuscated_claim}。",
+            "tags": ["#粉色瓶身", "#100ML", "#产品分享"],
+        },
+        ensure_ascii=False,
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return completion_response(mixed_content)
+
+    async def run() -> None:
+        settings = make_settings()
+        client = SiliconFlowClient(
+            settings,
+            transport=httpx.MockTransport(handler),
+        )
+        service = QwenGenerationService(settings, client)
+        try:
+            await service.generate(
+                image,
+                product_name=None,
+                target_audience=None,
+                tone=None,
+            )
+        finally:
+            await service.aclose()
+
+    caplog.set_level("WARNING")
+    with pytest.raises(APIError) as captured:
+        asyncio.run(run())
+
+    assert captured.value.code == "MODEL_OUTPUT_INVALID"
+    assert captured.value.status_code == 502
+    assert captured.value.retryable is True
+    assert call_count == 2
+    assert f"remaining_rule={expected_rule}" in caplog.text
+    assert "质地轻盈" not in caplog.text
+    assert obfuscated_claim not in caplog.text
+
+
+@pytest.mark.parametrize("obfuscated_claim", ["能美✨白", "能美/白"])
+def test_local_fallback_removes_inline_symbol_obfuscation_in_one_call(
+    tmp_path: Path,
+    obfuscated_claim: str,
+) -> None:
+    image = make_processed_image(tmp_path)
+    call_count = 0
+    mixed_content = json.dumps(
+        {
+            "image_summary": "图片中可见湖泊和树林。",
+            "title": "湖景记录",
+            "body": f"湖面倒映着树林。{obfuscated_claim}。",
+            "tags": ["#湖景", "#旅行", "#自然记录"],
+        },
+        ensure_ascii=False,
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return completion_response(mixed_content)
+
+    async def run() -> GeneratedCopy:
+        settings = make_settings()
+        client = SiliconFlowClient(
+            settings,
+            transport=httpx.MockTransport(handler),
+        )
+        service = QwenGenerationService(settings, client)
+        try:
+            return await service.generate(
+                image,
+                product_name=None,
+                target_audience=None,
+                tone=None,
+            )
+        finally:
+            await service.aclose()
+
+    result = asyncio.run(run())
+
+    assert call_count == 1
+    assert result.body == "湖面倒映着树林"
+    assert find_unsupported_claim_rule(result) is None
+    assert find_strict_unsupported_claim_rule(result) is None
 
 
 def test_ocr_category_conflict_is_rewritten_once(tmp_path: Path) -> None:
@@ -1439,7 +2216,7 @@ def test_ocr_category_conflict_is_rewritten_once(tmp_path: Path) -> None:
     assert "图片中是一瓶植物精油身体乳" not in prompts[1]
 
 
-def test_two_unsafe_outputs_fail_closed_without_leaking_copy(
+def test_two_obfuscated_outputs_fail_closed_without_leaking_copy(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1449,7 +2226,7 @@ def test_two_unsafe_outputs_fail_closed_without_leaking_copy(
     async def handler(_request: httpx.Request) -> httpx.Response:
         nonlocal call_count
         call_count += 1
-        return completion_response(UNSAFE_SKINCARE_CONTENT)
+        return completion_response(OBFUSCATED_MEDICAL_CONTENT)
 
     async def run() -> None:
         settings = make_settings()
@@ -1480,12 +2257,10 @@ def test_two_unsafe_outputs_fail_closed_without_leaking_copy(
     assert captured.value.__context__ is None
     assert call_count == 2
     assert "reason=unsupported_claim" in caplog.text
-    assert "敏肌姐妹可以试试" not in caplog.text
-    assert "用起来很安心" not in caplog.text
+    assert "具有治。疗作用" not in caplog.text
     assert_sensitive_request_is_unreachable(
         captured.value,
-        "敏肌姐妹可以试试",
-        "用起来很安心",
+        "具有治。疗作用",
         "植物精油身体乳",
     )
 
@@ -1501,7 +2276,7 @@ def test_format_failure_then_unsafe_output_does_not_get_third_call(
         call_count += 1
         if call_count == 1:
             return completion_response("not-json")
-        return completion_response(UNSAFE_SKINCARE_CONTENT)
+        return completion_response(OBFUSCATED_MEDICAL_CONTENT)
 
     async def run() -> None:
         settings = make_settings()
