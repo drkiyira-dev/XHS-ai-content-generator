@@ -565,10 +565,10 @@ function copyAll() {
           </el-button>
         </div>
 
-        <div class="result-block">
-          <h3>图片理解</h3>
+        <details class="image-summary-details">
+          <summary>图片理解摘要</summary>
           <p>{{ result.image_summary }}</p>
-        </div>
+        </details>
 
         <div class="result-block">
           <h3>标题</h3>
@@ -674,9 +674,10 @@ function copyAll() {
             </el-button>
           </div>
 
-          <p class="history-summary">
-            <strong>图片理解：</strong>{{ item.image_summary }}
-          </p>
+          <details class="image-summary-details">
+            <summary :aria-label="`图片理解摘要：${item.title}`">图片理解摘要</summary>
+            <p>{{ item.image_summary }}</p>
+          </details>
           <p class="history-body">{{ item.body }}</p>
           <div class="tags" aria-label="历史记录标签">
             <el-tag v-for="tag in item.tags" :key="tag" type="primary">
@@ -940,6 +941,49 @@ function copyAll() {
   line-height: 1.6;
 }
 
+.image-summary-details {
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0 0 20px;
+  overflow: hidden;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.image-summary-details summary {
+  box-sizing: border-box;
+  min-height: 44px;
+  padding: 11px 14px;
+  color: #3f3742;
+  font-weight: 650;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.image-summary-details summary::marker {
+  color: #b10f2a;
+}
+
+.image-summary-details summary:focus-visible {
+  outline: 3px solid rgba(177, 15, 42, 0.32);
+  outline-offset: -3px;
+}
+
+.image-summary-details[open] summary {
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.image-summary-details p {
+  margin: 0;
+  padding: 14px;
+  color: #1f2937;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .title-text {
   font-size: 18px;
   font-weight: 600;
@@ -1028,17 +1072,10 @@ function copyAll() {
   font-size: 13px;
 }
 
-.history-summary,
 .history-body {
   margin: 0 0 16px;
   color: #1f2937;
   line-height: 1.65;
-}
-
-.history-summary {
-  padding: 12px;
-  border-radius: 8px;
-  background: #f8fafc;
 }
 
 .history-body {
