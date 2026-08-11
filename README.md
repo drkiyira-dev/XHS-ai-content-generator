@@ -26,6 +26,7 @@
 ## 环境要求
 
 - Python 3.11 或更高版本
+- Node.js 24 与 npm（前端开发和 CI 的验证基线）
 - 可访问硅基流动 API
 - 可选：支持 `docker compose` 的当前 Docker Desktop 或 Docker Engine（用于一键编排）
 - 有权使用以下模型的硅基流动 API Key：
@@ -33,6 +34,8 @@
   - `PaddlePaddle/PaddleOCR-VL-1.5`
 
 ## 本地安装
+
+### 安装后端
 
 ```bash
 git clone https://github.com/drkiyira-dev/XHS-ai-content-generator.git
@@ -42,6 +45,17 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 ```
+
+### 安装前端
+
+```bash
+npm --prefix frontend ci
+cp frontend/.env.example frontend/.env
+```
+
+前端模板默认连接 `http://127.0.0.1:8000` 的真实 FastAPI；只有显式设置
+`VITE_USE_MOCK=true` 时才使用浏览器内 Mock 数据。前端配置中不得放入硅基流动 API Key
+或数据库密码。
 
 ## 配置环境变量
 
@@ -134,6 +148,21 @@ python -m uvicorn backend.main:app --reload
 模型、数据库或环境变量详情。若显式启用了 MySQL，数据库启动检查仍会在应用进入可用状态
 前独立执行，失败时应用会终止启动。
 
+## 启动前端
+
+保持后端运行，并在另一个终端中进入仓库根目录后执行：
+
+```bash
+npm --prefix frontend run dev -- --host 127.0.0.1
+```
+
+浏览器访问 <http://127.0.0.1:5173>。前端通过 `VITE_API_BASE_URL` 调用后端；默认地址已与
+上面的 FastAPI 启动命令匹配。提交或交付前可运行生产构建检查：
+
+```bash
+npm --prefix frontend run build
+```
+
 ## 后端 Docker 镜像（增值功能）
 
 仓库根目录提供后端专用的多阶段 `Dockerfile`。镜像使用 Python 3.12 Debian slim，
@@ -194,6 +223,10 @@ docker inspect --format '{{.State.Health.Status}}' xhs-ai-backend
 
 - 官方 `mysql:8.4.11` 镜像，数据保存在命名卷 `mysql_data`；
 - 当前仓库构建出的非 root FastAPI 后端镜像。
+
+该 Compose 配置**只编排后端与 MySQL，不包含前端容器**。启动成功后，仍需按照上面的
+“启动前端”步骤在宿主机运行 Vue 开发服务器；因此当前能力应描述为“后端与数据库一键
+编排”，不能描述为“一条命令部署完整网站”。
 
 先运行本地初始化脚本。脚本会隐藏输入 API Key、随机生成数据库密码，并创建四个相互
 一致的文件；不会把任何 secret 打印到终端：
