@@ -90,7 +90,6 @@ def _verify_identity_and_privileges(
         for metadata_table in (
             "TABLE_PRIVILEGES",
             "COLUMN_PRIVILEGES",
-            "ROUTINE_PRIVILEGES",
         ):
             extra_privileges = tuple(
                 session.execute(

@@ -188,7 +188,7 @@ def test_persistence_smoke_checks_only_fixed_local_database_invariants() -> None
     assert 'assert applicable_roles == ()' in source
     assert '"TABLE_PRIVILEGES"' in source
     assert '"COLUMN_PRIVILEGES"' in source
-    assert '"ROUTINE_PRIVILEGES"' in source
+    assert "ROUTINE_PRIVILEGES" not in source
     assert 'await persistence.create_pending(' in source
     assert 'await persistence.mark_success(' in source
     assert 'await persistence.list_successful(limit=50)' in source
