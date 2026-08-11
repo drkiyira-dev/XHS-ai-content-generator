@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.compose-secrets/
 
 # Frontend dependencies and build output
 frontend/node_modules/

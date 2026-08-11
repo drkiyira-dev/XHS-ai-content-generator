@@ -27,6 +27,7 @@
 
 - Python 3.11 或更高版本
 - 可访问硅基流动 API
+- 可选：支持 `docker compose` 的当前 Docker Desktop 或 Docker Engine（用于一键编排）
 - 有权使用以下模型的硅基流动 API Key：
   - `Qwen/Qwen3-VL-8B-Instruct`
   - `PaddlePaddle/PaddleOCR-VL-1.5`
@@ -184,8 +185,74 @@ docker inspect --format '{{.State.Health.Status}}' xhs-ai-backend
 当前历史接口仍是无登录鉴权的本地单用户功能。
 
 `127.0.0.1` 在容器中指向容器自身，不是宿主机 MySQL。本段因此明确保持数据库关闭；
-数据库容器编排、专用网络、迁移执行和持久卷属于后续 Docker Compose 段，不能用临时
-主机映射绕过现有 MySQL/TLS 安全检查。
+如需同时启动后端与数据库，请使用下一节的 Compose 配置，不能用临时主机映射绕过
+现有 MySQL/TLS 安全检查。
+
+## Docker Compose 一键编排（增值功能）
+
+仓库根目录的 `compose.yaml` 会启动两个服务：
+
+- 官方 `mysql:8.4.11` 镜像，数据保存在命名卷 `mysql_data`；
+- 当前仓库构建出的非 root FastAPI 后端镜像。
+
+先运行本地初始化脚本。脚本会隐藏输入 API Key、随机生成数据库密码，并创建四个相互
+一致的文件；不会把任何 secret 打印到终端：
+
+```bash
+python scripts/initialize_compose_secrets.py
+```
+
+文件保存在已被 Git 忽略的 `.compose-secrets/`。不要复制、截图、提交或把其中内容发送到
+聊天。宿主目录权限为 `0700`，文件为供非 root 容器只读 bind mount 使用的 `0444`；
+其他宿主用户无法穿过该目录读取文件。目录非空时脚本会拒绝覆盖，避免意外轮换正在
+使用的数据库密码。
+
+检查并启动：
+
+```bash
+docker compose config --quiet
+docker compose up --build --detach --wait
+```
+
+启动完成后访问 <http://127.0.0.1:8000/docs>。前端仍可在宿主机运行，并通过现有
+`http://127.0.0.1:8000` 地址调用后端。
+
+安全边界：
+
+- API Key、数据库 URL 和两个数据库密码都使用只读 Compose file secrets，不写入镜像、
+  Compose 环境变量或 Git；每个服务只挂载自己需要的 secret。
+- 后端与 MySQL 使用 `network_mode: service:mysql` 共享同一个网络命名空间，双方连接的
+  是该命名空间内真实的 `127.0.0.1`；MySQL 也只监听该地址。宿主机和其他容器均不发布
+  或暴露 `3306`，未使用的 MySQL X Protocol 也被关闭。因此没有把服务名伪装成回环
+  地址，也没有放宽非回环 MySQL 必须使用 CA 的既有规则。
+- `8000` 只发布到宿主机 `127.0.0.1`。专用 `runtime` bridge 允许后端访问硅基流动，
+  但不会向宿主机发布 MySQL。
+- 两个服务都禁用新增 Linux capabilities、启用 `no-new-privileges` 和只读根文件系统；
+  临时图片只写入后端 tmpfs。
+
+首次使用空的 `mysql_data` 卷时，MySQL 官方入口只创建 `xhs_ai`，随后按顺序执行
+`001_generation_records.sql` 与 `002_create_app_user.sh`。第二个脚本直接创建 `xhs_app`，
+第一次授权就只有运行时实际需要的 `SELECT`、`INSERT`、`UPDATE`；不存在先授予 `ALL` 再撤销的
+中断窗口。FastAPI 自身仍然只做启动检查，不执行 DDL。
+
+这些初始化脚本**只会在空数据卷上执行一次**。现有卷不会自动重放迁移；后续 schema
+变更必须使用单独、明确审批的迁移流程。若首次初始化中断或失败，应查看固定错误日志并
+删除这个尚未投入使用的失败卷后重新初始化；不得继续使用部分初始化的卷。普通停止会
+保留历史数据：
+
+```bash
+docker compose down
+```
+
+下面的命令会永久删除 Compose 数据库和全部生成历史，只能在明确确认不再需要数据时执行：
+
+```bash
+docker compose down --volumes
+```
+
+不要在保留 `mysql_data` 的同时删除并重新生成 `.compose-secrets/`，否则新密码会与卷内
+既有账号不一致。若 secret 丢失，应恢复原文件；只有决定清空全部 Compose 数据时，才先
+明确执行 `down --volumes`，再重新初始化 secrets。
 
 ## API 请求
 
@@ -352,14 +419,18 @@ XHS_MYSQL_LIVE_TEST_CONFIRM=YES_USE_XHS_AI_TEST \
 - `develop` 或 `main` 收到新的提交。
 - 在 GitHub Actions 页面手动触发。
 
-CI 包含三个互相独立的任务：
+CI 包含四个互相独立的任务：
 
 - Python 3.12：安装后端开发依赖并运行全部 `pytest`。
 - Node.js 24：使用 `npm ci` 按锁文件安装前端依赖并执行生产构建。
 - Docker：构建后端镜像，以非 root、只读文件系统、无网络和无 Linux capabilities 的
   容器执行 `/api/health` 冒烟检查；只使用无效占位 Key，不连接模型或 MySQL。
+- Docker Compose：使用临时占位 Key、随机数据库密码、内部无外网 bridge 和全新命名卷，
+  实际启动 MySQL 与后端；验证非 root/只读/capability 边界、secret 不进入容器环境变量、
+  3306 不发布、应用账号只有 `SELECT`/`INSERT`/`UPDATE`、持久化写读及容器重建后数据仍在，
+  最后只删除该次 CI project 的容器、网络、测试记录和数据卷。
 
-该 workflow 只有仓库内容读取权限，不使用硅基流动 Key、不连接 MySQL、
+该 workflow 只有仓库内容读取权限，不使用真实硅基流动 Key、不连接任何外部 MySQL、
 不登录镜像仓库、不推送镜像、不部署应用，也不会自动修改或合并 PR。重复推送同一分支
 时，较旧的运行会被取消。
 

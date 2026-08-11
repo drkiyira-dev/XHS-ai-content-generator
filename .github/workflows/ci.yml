@@ -143,3 +143,131 @@ jobs:
 
           docker exec "$CI_DOCKER_CONTAINER" python -c \
             'import json, urllib.request; response=urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=2); assert response.status == 200; assert json.load(response) == {"status": "ok"}'
+
+  compose-integration:
+    name: Docker Compose persistence smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Start, verify, recreate, and remove the Compose stack
+        env:
+          COMPOSE_PROJECT_NAME: xhs-compose-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          compose=(
+            docker compose
+            --file compose.yaml
+            --file compose.ci.yaml
+            --project-name "$COMPOSE_PROJECT_NAME"
+          )
+
+          verify_history() {
+            "${compose[@]}" exec -T backend python -c \
+              'import json,sys,urllib.request; request=urllib.request.Request("http://127.0.0.1:8000/api/v1/generations?limit=1", headers={"Accept":"application/json"}, method="GET"); response=urllib.request.urlopen(request, timeout=2); payload=json.load(response); assert response.status == 200; assert response.headers.get("Cache-Control") == "no-store"; assert payload["count"] == 1; assert len(payload["items"]) == 1; assert payload["items"][0]["generation_id"] == sys.argv[1]' \
+              "$1"
+          }
+
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then
+              "${compose[@]}" ps --all || true
+              "${compose[@]}" logs --no-color --tail=200 || true
+            fi
+            "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+            if [ -d .compose-secrets ]; then
+              find .compose-secrets -maxdepth 1 -type f -delete || true
+              rmdir .compose-secrets 2>/dev/null || true
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          python -c \
+            'from scripts.initialize_compose_secrets import initialize_compose_secrets; initialize_compose_secrets(api_key="ci-placeholder-not-a-secret")'
+
+          "${compose[@]}" config --quiet
+          "${compose[@]}" up --build --detach --wait --wait-timeout 240
+
+          mysql_id="$("${compose[@]}" ps --quiet mysql)"
+          backend_id="$("${compose[@]}" ps --quiet backend)"
+          test -n "$mysql_id"
+          test -n "$backend_id"
+          test "$("${compose[@]}" exec -T mysql id -u | tr -d '\r')" = "999"
+          test "$("${compose[@]}" exec -T backend id -u | tr -d '\r')" = "10001"
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$mysql_id")" = "true"
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$backend_id")" = "true"
+          test "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$mysql_id")" = '["ALL"]'
+          test "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$backend_id")" = '["ALL"]'
+
+          if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$backend_id" \
+            | grep -Eq '^(SILICONFLOW_API_KEY|DATABASE_URL)='; then
+            echo "Backend secrets must not be stored in container environment variables."
+            exit 1
+          fi
+          if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$mysql_id" \
+            | grep -Eq '^MYSQL_[A-Z0-9_]*PASSWORD='; then
+            echo "MySQL passwords must not be stored in container environment variables."
+            exit 1
+          fi
+
+          declared_port_bindings="$(docker inspect \
+            --format '{{json .HostConfig.PortBindings}}' "$mysql_id")"
+          python -c \
+            'import json,sys; bindings=json.loads(sys.argv[1]); assert bindings == {"8000/tcp":[{"HostIp":"127.0.0.1","HostPort":"8000"}]}' \
+            "$declared_port_bindings"
+
+          runtime_network="$(docker network ls \
+            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+            --filter 'label=com.docker.compose.network=runtime' \
+            --quiet)"
+          test -n "$runtime_network"
+          test "$(docker network inspect --format '{{.Internal}}' "$runtime_network")" = "true"
+
+          "${compose[@]}" exec -T backend python -c \
+            'import json, urllib.request; response=urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=2); assert response.status == 200; assert json.load(response) == {"status": "ok"}'
+
+          generation_id="$("${compose[@]}" exec -T backend python - write \
+            < scripts/compose_runtime_smoke.py | tr -d '\r')"
+          python -c \
+            'from uuid import UUID; import sys; value=sys.argv[1]; assert str(UUID(value)) == value' \
+            "$generation_id"
+          verify_history "$generation_id"
+
+          "${compose[@]}" rm --force --stop backend mysql
+          "${compose[@]}" up --detach --wait --wait-timeout 240
+          recreated_mysql_id="$("${compose[@]}" ps --quiet mysql)"
+          recreated_backend_id="$("${compose[@]}" ps --quiet backend)"
+          test -n "$recreated_mysql_id"
+          test -n "$recreated_backend_id"
+          test "$recreated_mysql_id" != "$mysql_id"
+          test "$recreated_backend_id" != "$backend_id"
+          "${compose[@]}" exec -T backend python - read "$generation_id" \
+            < scripts/compose_runtime_smoke.py
+          verify_history "$generation_id"
+
+          "${compose[@]}" down --volumes --remove-orphans
+          remaining_volumes="$(docker volume ls \
+            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+            --quiet)"
+          remaining_containers="$(docker container ls --all \
+            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+            --quiet)"
+          remaining_networks="$(docker network ls \
+            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+            --quiet)"
+          test -z "$remaining_volumes"
+          test -z "$remaining_containers"
+          test -z "$remaining_networks"
