@@ -3,6 +3,7 @@ import { ref, reactive } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { UploadInstance } from 'element-plus'
 import { DocumentCopy, RefreshRight, Delete } from '@element-plus/icons-vue'
+import LandingPage from './components/LandingPage.vue'
 import {
   generate,
   listGenerations,
@@ -21,10 +22,10 @@ const errorMessage = ref('')
 const errorRetryable = ref(false)
 
 // ===== 页面切换与历史记录状态 =====
-type ActiveView = 'generate' | 'history'
+type ActiveView = 'home' | 'generate' | 'history'
 type HistoryStatus = 'idle' | 'loading' | 'success' | 'error'
 const HISTORY_LIMIT = 20
-const activeView = ref<ActiveView>('generate')
+const activeView = ref<ActiveView>('home')
 const historyStatus = ref<HistoryStatus>('idle')
 const historyItems = ref<GenerationResponse[]>([])
 const historyCount = ref(0)
@@ -288,6 +289,9 @@ async function handleGenerate() {
 // ===== 历史记录 =====
 async function showHistory() {
   activeView.value = 'history'
+  requestAnimationFrame(() => {
+    document.getElementById('history-panel')?.scrollIntoView({ block: 'start' })
+  })
   if (!historyLoaded.value) {
     await loadHistory()
   }
@@ -295,6 +299,16 @@ async function showHistory() {
 
 function showGenerator() {
   activeView.value = 'generate'
+  requestAnimationFrame(() => {
+    document.getElementById('generator-panel')?.scrollIntoView({ block: 'start' })
+  })
+}
+
+function showHome() {
+  activeView.value = 'home'
+  requestAnimationFrame(() => {
+    document.getElementById('home-panel')?.scrollIntoView({ block: 'start' })
+  })
 }
 
 async function loadHistory() {
@@ -368,29 +382,50 @@ function copyAll() {
 
 <template>
   <div class="app">
-    <h1 class="title">小红书文案生成平台</h1>
-    <p class="subtitle">上传一张图，AI 帮你写小红书笔记</p>
+    <header class="site-header">
+      <button type="button" class="brand" aria-label="返回产品首页" @click="showHome">
+        <span aria-hidden="true">图</span>
+        <strong>图文种草助手</strong>
+      </button>
 
-    <nav class="view-switch" aria-label="页面导航">
-      <el-button
-        id="generator-nav-button"
-        :type="activeView === 'generate' ? 'primary' : 'default'"
-        :aria-pressed="activeView === 'generate'"
-        aria-controls="generator-panel"
-        @click="showGenerator"
-      >
-        生成文案
-      </el-button>
-      <el-button
-        id="history-nav-button"
-        :type="activeView === 'history' ? 'primary' : 'default'"
-        :aria-pressed="activeView === 'history'"
-        aria-controls="history-panel"
-        @click="showHistory"
-      >
-        历史记录
-      </el-button>
-    </nav>
+      <nav class="view-switch" aria-label="页面导航">
+        <el-button
+          id="home-nav-button"
+          :type="activeView === 'home' ? 'primary' : 'default'"
+          :aria-pressed="activeView === 'home'"
+          aria-controls="home-panel"
+          @click="showHome"
+        >
+          产品首页
+        </el-button>
+        <el-button
+          id="generator-nav-button"
+          :type="activeView === 'generate' ? 'primary' : 'default'"
+          :aria-pressed="activeView === 'generate'"
+          aria-controls="generator-panel"
+          @click="showGenerator"
+        >
+          生成文案
+        </el-button>
+        <el-button
+          id="history-nav-button"
+          :type="activeView === 'history' ? 'primary' : 'default'"
+          :aria-pressed="activeView === 'history'"
+          aria-controls="history-panel"
+          @click="showHistory"
+        >
+          历史记录
+        </el-button>
+      </nav>
+    </header>
+
+    <main class="site-main">
+      <LandingPage v-show="activeView === 'home'" @start="showGenerator" />
+
+      <div v-show="activeView !== 'home'" class="workspace-heading">
+        <h1 class="title">小红书文案生成平台</h1>
+        <p class="subtitle">上传一张图，AI 帮你写小红书内容初稿</p>
+      </div>
 
     <section
       v-show="activeView === 'generate'"
@@ -398,10 +433,11 @@ function copyAll() {
       class="card"
       role="region"
       aria-labelledby="generator-nav-button"
+      :aria-busy="status === 'loading'"
     >
       <!-- 图片上传 -->
       <div class="section">
-        <label class="label">1. 上传图片</label>
+        <h2 class="label">1. 上传图片</h2>
         <el-upload
           v-if="!imagePreviewUrl"
           ref="uploadRef"
@@ -413,13 +449,14 @@ function copyAll() {
           :on-change="handleImageChange"
           :limit="1"
           :show-file-list="false"
+          aria-describedby="upload-help"
         >
           <el-icon class="el-icon--upload"><upload-filled /></el-icon>
           <div class="el-upload__text">
             拖拽图片到这里，或 <em>点击上传</em>
           </div>
           <template #tip>
-            <div class="el-upload__tip">
+            <div id="upload-help" class="el-upload__tip">
               仅支持 JPG / JPEG / PNG / WebP / HEIC / HEIF，最大 10MB
             </div>
           </template>
@@ -436,7 +473,7 @@ function copyAll() {
             <strong>{{ imageFile?.name }}</strong>
             <span>浏览器不直接预览此格式，将由后端安全转换为 JPEG</span>
           </div>
-          <img v-else :src="imagePreviewUrl" alt="preview" />
+          <img v-else :src="imagePreviewUrl" alt="已选择的商品图片预览" />
           <el-button
             class="delete-btn"
             type="danger"
@@ -447,15 +484,37 @@ function copyAll() {
             重新上传
           </el-button>
         </div>
+
+        <p class="privacy-note">
+          点击生成后，图片会经本地后端发送至已配置的第三方视觉模型服务。
+          请勿上传敏感或无授权图片；AI 输出可能有误，发布前请再次核对。
+        </p>
       </div>
 
       <!-- 可选参数 -->
       <div class="section">
-        <label class="label">2. 填写可选信息（不填也行）</label>
+        <h2 class="label">2. 填写可选信息（不填也行）</h2>
         <div class="form-row">
-          <el-input v-model="form.productName" placeholder="产品名，例如：柠檬气泡水" />
-          <el-input v-model="form.targetAudience" placeholder="目标人群，例如：年轻女生" />
-          <el-input v-model="form.tone" placeholder="语气，例如：轻松种草" />
+          <div class="form-field">
+            <label for="product-name">产品名</label>
+            <el-input
+              id="product-name"
+              v-model="form.productName"
+              placeholder="例如：柠檬气泡水"
+            />
+          </div>
+          <div class="form-field">
+            <label for="target-audience">目标人群</label>
+            <el-input
+              id="target-audience"
+              v-model="form.targetAudience"
+              placeholder="例如：年轻女生"
+            />
+          </div>
+          <div class="form-field">
+            <label for="tone">语气</label>
+            <el-input id="tone" v-model="form.tone" placeholder="例如：轻松种草" />
+          </div>
         </div>
       </div>
 
@@ -479,6 +538,7 @@ function copyAll() {
         type="error"
         show-icon
         class="alert"
+        role="alert"
       />
 
       <!-- 成功时允许再次生成；失败时仅对可重试错误显示快捷重试按钮。 -->
@@ -497,7 +557,7 @@ function copyAll() {
       </div>
 
       <!-- 结果展示 -->
-      <div v-if="status === 'success'" class="result">
+      <div v-if="status === 'success'" class="result" aria-live="polite">
         <div class="result-header">
           <h2>生成结果</h2>
           <el-button type="success" :icon="DocumentCopy" @click="copyAll">
@@ -517,7 +577,7 @@ function copyAll() {
 
         <div class="result-block">
           <h3>正文</h3>
-          <p class="body-text" style="white-space: pre-line;">{{ result.body }}</p>
+          <p class="body-text">{{ result.body }}</p>
         </div>
 
         <div class="result-block">
@@ -626,42 +686,113 @@ function copyAll() {
         </article>
       </div>
     </section>
+    </main>
   </div>
 </template>
 
 <style scoped>
 .app {
-  max-width: 720px;
+  max-width: 1120px;
   margin: 0 auto;
   padding: 40px 20px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  color: #211b23;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.brand span {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 11px;
+  color: #fff;
+  background: #c1122f;
+  font-size: 15px;
+  font-weight: 800;
+  box-shadow: 0 8px 18px rgba(193, 18, 47, 0.22);
+}
+
+.brand strong {
+  font-size: 16px;
+}
+
+.brand:focus-visible {
+  outline: 3px solid rgba(193, 18, 47, 0.3);
+  outline-offset: 4px;
+  border-radius: 8px;
+}
+
+.site-main {
+  display: block;
+}
+
+.workspace-heading {
+  margin: 38px auto 28px;
+  text-align: center;
+}
+
 .title {
   text-align: center;
   font-size: 28px;
-  margin-bottom: 8px;
+  margin: 0 0 8px;
   color: #1f2937;
 }
 
 .subtitle {
   text-align: center;
   color: #6b7280;
-  margin-bottom: 32px;
+  margin: 0 0 32px;
 }
 
 .view-switch {
   display: flex;
   justify-content: center;
   gap: 12px;
-  margin-bottom: 20px;
 }
 
 .view-switch .el-button + .el-button {
   margin-left: 0;
 }
 
+.view-switch :deep(.el-button) {
+  min-height: 44px;
+  padding-inline: 18px;
+}
+
+.view-switch :deep(.el-button--primary) {
+  border-color: #b10f2a;
+  background: #b10f2a;
+}
+
+.view-switch :deep(.el-button:focus-visible) {
+  outline: 3px solid rgba(177, 15, 42, 0.3);
+  outline-offset: 2px;
+}
+
 .card {
+  box-sizing: border-box;
+  width: min(100%, 720px);
+  margin: 0 auto;
   background: #fff;
   border-radius: 12px;
   padding: 28px;
@@ -679,14 +810,53 @@ function copyAll() {
 .label {
   display: block;
   font-weight: 600;
+  font-size: 16px;
+  line-height: 1.5;
+  margin-top: 0;
   margin-bottom: 12px;
   color: #374151;
+}
+
+.upload :deep(.el-upload__text em) {
+  color: #a70f2a;
+  font-weight: 700;
+}
+
+.privacy-note {
+  margin: 16px 0 0;
+  padding: 12px 14px;
+  border-left: 3px solid #c1122f;
+  border-radius: 6px;
+  color: #5f5661;
+  background: #fff5f6;
+  font-size: 13px;
+  line-height: 1.65;
 }
 
 .form-row {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.form-field {
+  display: grid;
+  gap: 7px;
+  text-align: left;
+}
+
+.form-field label {
+  color: #4b4450;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.form-field :deep(.el-input__wrapper) {
+  min-height: 44px;
+}
+
+.form-field :deep(.el-input__inner) {
+  font-size: 16px;
 }
 
 .preview {
@@ -773,7 +943,11 @@ function copyAll() {
 .title-text {
   font-size: 18px;
   font-weight: 600;
-  color: #ff2442;
+  color: #b10f2a;
+}
+
+.body-text {
+  white-space: pre-line;
 }
 
 .tags {
@@ -878,6 +1052,15 @@ function copyAll() {
 
   .card {
     padding: 20px 16px;
+  }
+
+  .site-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .brand {
+    align-self: center;
   }
 
   .view-switch,
