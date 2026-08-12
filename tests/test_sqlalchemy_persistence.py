@@ -20,11 +20,16 @@ from backend.services.image import ProcessedImage
 from backend.services.model import GeneratedCopy
 from backend.services.persistence import (
     GenerationPersistenceError,
+    NoOpGenerationPersistence,
     PendingGeneration,
     SQLAlchemyGenerationPersistence,
     SuccessfulGeneration,
 )
 from tests.support import build_test_app, make_image_bytes, send_request
+
+
+TEST_USER_ID = 101
+OTHER_USER_ID = 202
 
 
 class FailingModelService:
@@ -172,9 +177,10 @@ def test_adapter_rolls_back_invalid_copy_and_returns_one_sanitized_error(
 ) -> None:
     generation_id = str(uuid4())
     created_at = datetime.now(UTC)
-    pending = PendingGeneration(generation_id, created_at)
+    pending = PendingGeneration(generation_id, TEST_USER_ID, created_at)
     invalid = SuccessfulGeneration(
         generation_id=generation_id,
+        user_id=TEST_USER_ID,
         image_summary="图片描述",
         title=(
             "这是一个明显超过二十个汉字"
@@ -203,7 +209,7 @@ def test_duplicate_pending_error_has_no_sqlalchemy_context_or_details(
     tmp_path: Path,
 ) -> None:
     generation_id = str(uuid4())
-    pending = PendingGeneration(generation_id, datetime.now(UTC))
+    pending = PendingGeneration(generation_id, TEST_USER_ID, datetime.now(UTC))
 
     with persistence_database(tmp_path) as (adapter, factory):
         asyncio.run(adapter.create_pending(pending))
@@ -232,9 +238,10 @@ def test_adapter_uses_injected_clock_and_stores_it_as_utc(
         30,
         tzinfo=timezone(timedelta(hours=9)),
     )
-    pending = PendingGeneration(generation_id, created_at)
+    pending = PendingGeneration(generation_id, TEST_USER_ID, created_at)
     success = SuccessfulGeneration(
         generation_id=generation_id,
+        user_id=TEST_USER_ID,
         image_summary="图片描述",
         title="标题",
         body="正文内容",
@@ -250,6 +257,7 @@ def test_adapter_uses_injected_clock_and_stores_it_as_utc(
         records = load_records(factory)
 
     assert len(records) == 1
+    assert records[0].user_id == TEST_USER_ID
     assert records[0].updated_at == datetime(2026, 8, 9, 6, 30)
 
 
@@ -306,7 +314,7 @@ def test_adapter_database_work_does_not_block_the_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generation_id = str(uuid4())
-    pending = PendingGeneration(generation_id, datetime.now(UTC))
+    pending = PendingGeneration(generation_id, TEST_USER_ID, datetime.now(UTC))
     original_create_pending = persistence_module.create_pending_record
 
     def slow_create_pending(session: Session, **kwargs: object) -> object:
@@ -334,3 +342,129 @@ def test_adapter_database_work_does_not_block_the_event_loop(
     assert blocked is False
     assert len(records) == 1
     assert records[0].task_id == generation_id
+
+
+def test_adapter_lists_only_the_requested_users_successes(
+    tmp_path: Path,
+) -> None:
+    created_at = datetime.now(UTC)
+
+    with persistence_database(tmp_path) as (adapter, _factory):
+        for index, user_id in enumerate(
+            (TEST_USER_ID, OTHER_USER_ID, TEST_USER_ID)
+        ):
+            generation_id = str(uuid4())
+            asyncio.run(
+                adapter.create_pending(
+                    PendingGeneration(
+                        generation_id=generation_id,
+                        user_id=user_id,
+                        created_at=created_at + timedelta(minutes=index),
+                    )
+                )
+            )
+            asyncio.run(
+                adapter.mark_success(
+                    SuccessfulGeneration(
+                        generation_id=generation_id,
+                        user_id=user_id,
+                        image_summary=f"用户 {user_id} 的图片描述",
+                        title=f"标题{index}",
+                        body=f"正文内容{index}",
+                        tags=("#一", "#二", "#三"),
+                    )
+                )
+            )
+
+        records = asyncio.run(
+            adapter.list_successful(user_id=TEST_USER_ID, limit=50)
+        )
+
+    assert len(records) == 2
+    assert [record.user_id for record in records] == [TEST_USER_ID, TEST_USER_ID]
+    assert [record.title for record in records] == ["标题2", "标题0"]
+
+
+def test_adapter_wrong_owner_transition_is_sanitized_and_does_not_write(
+    tmp_path: Path,
+) -> None:
+    generation_id = str(uuid4())
+    pending = PendingGeneration(
+        generation_id=generation_id,
+        user_id=TEST_USER_ID,
+        created_at=datetime.now(UTC),
+    )
+    wrong_owner_success = SuccessfulGeneration(
+        generation_id=generation_id,
+        user_id=OTHER_USER_ID,
+        image_summary="图片描述",
+        title="标题",
+        body="正文内容",
+        tags=("#一", "#二", "#三"),
+    )
+
+    with persistence_database(tmp_path) as (adapter, factory):
+        asyncio.run(adapter.create_pending(pending))
+        with pytest.raises(GenerationPersistenceError) as caught:
+            asyncio.run(adapter.mark_success(wrong_owner_success))
+        records = load_records(factory)
+
+    assert str(caught.value) == "generation persistence failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert len(records) == 1
+    assert records[0].user_id == TEST_USER_ID
+    assert records[0].status == "pending"
+
+
+@pytest.mark.parametrize("user_id", [True, 0, -1, "101"])
+def test_adapter_list_rejects_invalid_user_without_database_details(
+    tmp_path: Path,
+    user_id: object,
+) -> None:
+    with persistence_database(tmp_path) as (adapter, _factory):
+        with pytest.raises(GenerationPersistenceError) as caught:
+            asyncio.run(
+                adapter.list_successful(
+                    user_id=user_id,  # type: ignore[arg-type]
+                    limit=10,
+                )
+            )
+
+    assert str(caught.value) == "generation persistence failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_noop_persistence_enforces_the_same_user_contract() -> None:
+    adapter = NoOpGenerationPersistence()
+    valid = PendingGeneration(
+        generation_id=str(uuid4()),
+        user_id=TEST_USER_ID,
+        created_at=datetime.now(UTC),
+    )
+
+    asyncio.run(adapter.create_pending(valid))
+    asyncio.run(
+        adapter.create_pending(
+            PendingGeneration(
+                generation_id=str(uuid4()),
+                user_id=None,
+                created_at=datetime.now(UTC),
+            )
+        )
+    )
+    assert asyncio.run(
+        adapter.list_successful(user_id=TEST_USER_ID, limit=10)
+    ) == ()
+    assert asyncio.run(adapter.list_successful(user_id=None, limit=10)) == ()
+
+    invalid = PendingGeneration(
+        generation_id=str(uuid4()),
+        user_id=0,
+        created_at=datetime.now(UTC),
+    )
+    with pytest.raises(GenerationPersistenceError):
+        asyncio.run(adapter.create_pending(invalid))
+    with pytest.raises(GenerationPersistenceError):
+        asyncio.run(adapter.list_successful(user_id=0, limit=10))

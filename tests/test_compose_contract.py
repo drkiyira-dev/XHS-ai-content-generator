@@ -56,6 +56,8 @@ def test_compose_grants_each_service_only_its_required_file_secrets() -> None:
     assert "MYSQL_ROOT_PASSWORD" not in mysql["environment"]
     assert backend["environment"] == {
         "DATABASE_ENABLED": "true",
+        "AUTH_ENABLED": "false",
+        "AUTH_COOKIE_SECURE": "false",
         "UPLOAD_DIR": "/run/xhs/uploads",
     }
 
@@ -111,8 +113,22 @@ def test_compose_initialization_is_scoped_and_permission_reducing() -> None:
     assert set(bind_mounts) == {
         "./migrations/001_generation_records.sql",
         "./migrations/002_create_app_user.sh",
+        "./migrations/003_auth_tables.sql",
+        "./migrations/004_generation_ownership.sql",
+        "./migrations/005_generation_previews_and_deletion.sql",
     }
     assert all(volume["read_only"] is True for volume in bind_mounts.values())
+    assert [
+        volume["target"]
+        for volume in mysql["volumes"]
+        if volume["type"] == "bind"
+    ] == [
+        "/docker-entrypoint-initdb.d/001_generation_records.sql",
+        "/docker-entrypoint-initdb.d/002_create_app_user.sh",
+        "/docker-entrypoint-initdb.d/003_auth_tables.sql",
+        "/docker-entrypoint-initdb.d/004_generation_ownership.sql",
+        "/docker-entrypoint-initdb.d/005_generation_previews_and_deletion.sql",
+    ]
 
     migration_path = PROJECT_ROOT / "migrations" / "002_create_app_user.sh"
     assert not stat.S_IMODE(migration_path.stat().st_mode) & stat.S_IXUSR

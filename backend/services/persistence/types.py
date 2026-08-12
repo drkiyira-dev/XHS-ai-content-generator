@@ -1,6 +1,6 @@
 """B-owned contracts for persisting one generation lifecycle."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
@@ -10,6 +10,7 @@ class PendingGeneration:
     """Minimal record created before the model request starts."""
 
     generation_id: str
+    user_id: int | None
     created_at: datetime
 
 
@@ -18,10 +19,13 @@ class SuccessfulGeneration:
     """Validated model output ready to be stored as a success."""
 
     generation_id: str
+    user_id: int | None
     image_summary: str
     title: str
     body: str
     tags: tuple[str, ...]
+    image_preview: bytes | None = field(default=None, repr=False)
+    image_preview_media_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +33,7 @@ class FailedGeneration:
     """Safe failure metadata that never contains private exception text."""
 
     generation_id: str
+    user_id: int | None
     error_code: str
     failed_at: datetime
 
@@ -38,11 +43,32 @@ class StoredGeneration:
     """One successful generation safe to expose in local history."""
 
     generation_id: str
+    user_id: int | None
     image_summary: str
     title: str
     body: str
     tags: tuple[str, ...]
     created_at: datetime
+    has_image_preview: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class StoredImagePreview:
+    """Owner-scoped preview bytes; never serialize this object as history JSON."""
+
+    generation_id: str
+    user_id: int | None
+    content: bytes = field(repr=False)
+    media_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeletedGeneration:
+    """Internal result of an owner-scoped, idempotent soft deletion."""
+
+    generation_id: str
+    user_id: int | None
+    deleted_now: bool
 
 
 class GenerationPersistenceError(Exception):
@@ -67,6 +93,39 @@ class GenerationPersistence(Protocol):
         """Mark the lifecycle failed using only a stable error code."""
         ...
 
-    async def list_successful(self, *, limit: int) -> tuple[StoredGeneration, ...]:
-        """Return the most recent successful generations, newest first."""
+    async def list_successful(
+        self,
+        *,
+        user_id: int | None,
+        limit: int,
+    ) -> tuple[StoredGeneration, ...]:
+        """Return one user's recent successful generations, newest first."""
+        ...
+
+    async def get_successful(
+        self,
+        *,
+        generation_id: str,
+        user_id: int | None,
+    ) -> StoredGeneration | None:
+        """Return one visible successful generation inside its owner partition."""
+        ...
+
+    async def get_image_preview(
+        self,
+        *,
+        generation_id: str,
+        user_id: int | None,
+    ) -> StoredImagePreview | None:
+        """Return private preview bytes only for a visible owned success."""
+        ...
+
+    async def delete_successful(
+        self,
+        *,
+        generation_id: str,
+        user_id: int | None,
+        deleted_at: datetime,
+    ) -> DeletedGeneration | None:
+        """Soft-delete one owned success, succeeding again after prior deletion."""
         ...

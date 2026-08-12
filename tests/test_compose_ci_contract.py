@@ -191,7 +191,8 @@ def test_persistence_smoke_checks_only_fixed_local_database_invariants() -> None
     assert "ROUTINE_PRIVILEGES" not in source
     assert 'await persistence.create_pending(' in source
     assert 'await persistence.mark_success(' in source
-    assert 'await persistence.list_successful(limit=50)' in source
+    assert 'user_id=None' in source
+    assert 'await persistence.list_successful(user_id=None, limit=50)' in source
     assert 'Path("/run/xhs/uploads")' in source
     assert imported_modules == {
         "__future__",

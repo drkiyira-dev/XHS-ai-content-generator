@@ -18,11 +18,16 @@ from backend.db import (
     TASK_STATUS_PENDING,
     TASK_STATUS_SUCCESS,
     create_pending,
+    get_record,
     mark_failed,
     mark_success,
 )
 from backend.schemas import BusinessException, ErrorCode
 from backend.validation import validate_generation_result
+
+
+TEST_USER_ID = 101
+OTHER_USER_ID = 202
 
 
 @contextmanager
@@ -66,6 +71,7 @@ def create_one_pending(
         create_pending(
             session,
             generation_id=generation_id,
+            user_id=TEST_USER_ID,
             created_at=created_at,
         )
 
@@ -80,6 +86,7 @@ def test_create_pending_persists_the_exact_b_generation_id(tmp_path: Path) -> No
 
     assert record.task_id == generation_id
     assert record.generation_id == generation_id
+    assert record.user_id == TEST_USER_ID
     assert record.status == TASK_STATUS_PENDING
     assert record.created_at == created_at.replace(tzinfo=None)
     assert record.title is None
@@ -96,6 +103,7 @@ def test_success_runs_c_validation_and_cannot_be_reversed(tmp_path: Path) -> Non
             success = mark_success(
                 session,
                 generation_id=generation_id,
+                user_id=TEST_USER_ID,
                 image_summary="海边可以看到一只白色帆布包。",
                 title="海边帆布包",
                 body="白色包身放在浅色沙滩上。",
@@ -113,6 +121,7 @@ def test_success_runs_c_validation_and_cannot_be_reversed(tmp_path: Path) -> Non
                 mark_failed(
                     session,
                     generation_id=generation_id,
+                    user_id=TEST_USER_ID,
                     error_code="MODEL_FAILED",
                     failed_at=created_at + timedelta(seconds=3),
                 )
@@ -135,11 +144,13 @@ def test_same_session_transition_refreshes_the_loaded_pending_record(
             pending = create_pending(
                 session,
                 generation_id=generation_id,
+                user_id=TEST_USER_ID,
                 created_at=created_at,
             )
             success = mark_success(
                 session,
                 generation_id=generation_id,
+                user_id=TEST_USER_ID,
                 image_summary="图片中是一只白色包。",
                 title="白色包袋",
                 body="白色包身配有黑色提手。",
@@ -165,6 +176,7 @@ def test_failure_stores_only_stable_code_and_cannot_be_reversed(
             failed = mark_failed(
                 session,
                 generation_id=generation_id,
+                user_id=TEST_USER_ID,
                 error_code="MODEL_TIMEOUT",
                 failed_at=created_at + timedelta(seconds=2),
             )
@@ -178,6 +190,7 @@ def test_failure_stores_only_stable_code_and_cannot_be_reversed(
                 mark_success(
                     session,
                     generation_id=generation_id,
+                    user_id=TEST_USER_ID,
                     image_summary="图片描述",
                     title="标题",
                     body="正文内容",
@@ -204,6 +217,7 @@ def test_invalid_copy_leaves_the_database_record_pending(tmp_path: Path) -> None
                 mark_success(
                     session,
                     generation_id=generation_id,
+                    user_id=TEST_USER_ID,
                     image_summary="图片描述",
                     title=(
                         "这个标题已经明显超过二十个汉字"
@@ -304,6 +318,7 @@ def test_invalid_failure_code_does_not_change_pending_record(tmp_path: Path) -> 
                 mark_failed(
                     session,
                     generation_id=generation_id,
+                    user_id=TEST_USER_ID,
                     error_code="private database message",
                     failed_at=created_at + timedelta(seconds=1),
                 )
@@ -325,6 +340,7 @@ def test_generation_id_with_whitespace_is_rejected_not_rewritten(
                 create_pending(
                     session,
                     generation_id=f" {generation_id}",
+                    user_id=TEST_USER_ID,
                     created_at=datetime.now(UTC),
                 )
         with factory() as session:
@@ -349,6 +365,7 @@ def test_duplicate_generation_id_rolls_back_without_duplicate_row(
                 create_pending(
                     session,
                     generation_id=generation_id,
+                    user_id=TEST_USER_ID,
                     created_at=created_at,
                 )
         with factory() as session:
@@ -357,3 +374,126 @@ def test_duplicate_generation_id_rolls_back_without_duplicate_row(
             )
 
     assert record_count == 1
+
+
+def test_repository_hides_another_users_record_and_rejects_transition(
+    tmp_path: Path,
+) -> None:
+    generation_id = str(uuid4())
+    created_at = datetime.now(UTC)
+
+    with database(tmp_path) as factory:
+        create_one_pending(factory, generation_id, created_at)
+        with factory() as session:
+            assert (
+                get_record(
+                    session,
+                    generation_id=generation_id,
+                    user_id=OTHER_USER_ID,
+                )
+                is None
+            )
+            owned = get_record(
+                session,
+                generation_id=generation_id,
+                user_id=TEST_USER_ID,
+            )
+            assert owned is not None
+            assert owned.user_id == TEST_USER_ID
+
+        with pytest.raises(BusinessException) as caught:
+            with factory.begin() as session:
+                mark_success(
+                    session,
+                    generation_id=generation_id,
+                    user_id=OTHER_USER_ID,
+                    image_summary="图片描述",
+                    title="标题",
+                    body="正文内容",
+                    tags=("#一", "#二", "#三"),
+                    completed_at=created_at + timedelta(seconds=1),
+                )
+
+        record = load_record(factory, generation_id)
+
+    assert caught.value.code == ErrorCode.TASK_NOT_FOUND
+    assert record.status == TASK_STATUS_PENDING
+    assert record.title is None
+
+
+def test_repository_wrong_owner_cannot_mark_a_pending_record_failed(
+    tmp_path: Path,
+) -> None:
+    generation_id = str(uuid4())
+    created_at = datetime.now(UTC)
+
+    with database(tmp_path) as factory:
+        create_one_pending(factory, generation_id, created_at)
+        with pytest.raises(BusinessException) as caught:
+            with factory.begin() as session:
+                mark_failed(
+                    session,
+                    generation_id=generation_id,
+                    user_id=OTHER_USER_ID,
+                    error_code="MODEL_FAILED",
+                    failed_at=created_at + timedelta(seconds=1),
+                )
+        record = load_record(factory, generation_id)
+
+    assert caught.value.code == ErrorCode.TASK_NOT_FOUND
+    assert record.status == TASK_STATUS_PENDING
+    assert record.error_code is None
+
+
+@pytest.mark.parametrize("user_id", [True, 0, -1, "101"])
+def test_repository_rejects_invalid_user_id_without_writing(
+    tmp_path: Path,
+    user_id: object,
+) -> None:
+    with database(tmp_path) as factory:
+        with pytest.raises(BusinessException) as caught:
+            with factory.begin() as session:
+                create_pending(
+                    session,
+                    generation_id=str(uuid4()),
+                    user_id=user_id,  # type: ignore[arg-type]
+                    created_at=datetime.now(UTC),
+                )
+        with factory() as session:
+            record_count = session.scalar(
+                select(func.count()).select_from(GenerationRecord)
+            )
+
+    assert caught.value.code == ErrorCode.VALIDATION_ERROR
+    assert record_count == 0
+
+
+def test_repository_keeps_the_legacy_null_owner_partition_explicit(
+    tmp_path: Path,
+) -> None:
+    generation_id = str(uuid4())
+    created_at = datetime.now(UTC)
+
+    with database(tmp_path) as factory:
+        with factory.begin() as session:
+            create_pending(
+                session,
+                generation_id=generation_id,
+                user_id=None,
+                created_at=created_at,
+            )
+        with factory() as session:
+            legacy = get_record(
+                session,
+                generation_id=generation_id,
+                user_id=None,
+            )
+            authenticated = get_record(
+                session,
+                generation_id=generation_id,
+                user_id=TEST_USER_ID,
+            )
+
+    assert legacy is not None
+    assert legacy.user_id is None
+    assert authenticated is None

@@ -129,6 +129,16 @@ class Settings(BaseSettings):
         validation_alias="DATABASE_TLS_CA",
         description="CA certificate required for a non-loopback MySQL host.",
     )
+    auth_cookie_secure: bool = Field(
+        default=False,
+        validation_alias="AUTH_COOKIE_SECURE",
+        description="Use a Secure __Host- cookie outside local HTTP development.",
+    )
+    auth_enabled: bool = Field(
+        default=False,
+        validation_alias="AUTH_ENABLED",
+        description="Explicit opt-in for local account authentication routes.",
+    )
 
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,
@@ -184,6 +194,35 @@ class Settings(BaseSettings):
         """Treat the optional blank template value as no CA path."""
         if isinstance(value, str):
             return value.strip() or None
+        return value
+
+    @field_validator("auth_enabled")
+    @classmethod
+    def validate_auth_configuration(
+        cls,
+        value: bool,
+        info: ValidationInfo,
+    ) -> bool:
+        """Fail closed without retaining a database URL in validation input."""
+        if not value:
+            return value
+        if info.data.get("database_enabled") is not True:
+            raise ValueError("AUTH_ENABLED requires DATABASE_ENABLED")
+
+        cors_value = info.data.get("cors_allow_origins")
+        cookie_secure = info.data.get("auth_cookie_secure") is True
+        origins = cors_value.split(",") if isinstance(cors_value, str) else []
+        if cookie_secure:
+            valid_origins = bool(origins) and all(
+                urlsplit(origin).scheme == "https" for origin in origins
+            )
+        else:
+            valid_origins = bool(origins) and all(
+                urlsplit(origin).hostname in {"localhost", "127.0.0.1"}
+                for origin in origins
+            )
+        if not valid_origins:
+            raise ValueError("authentication CORS origins are not authorized")
         return value
 
     @field_validator("siliconflow_base_url")
@@ -263,6 +302,16 @@ class Settings(BaseSettings):
         if self.database_tls_ca.is_absolute():
             return self.database_tls_ca
         return PROJECT_ROOT / self.database_tls_ca
+
+    @property
+    def auth_cookie_name(self) -> str:
+        """Return a fixed cookie name appropriate for the selected transport."""
+        return "__Host-xhs_session" if self.auth_cookie_secure else "xhs_session_local"
+
+    @property
+    def auth_cookie_path(self) -> str:
+        """Keep the local cookie away from ordinary Vite page and HMR requests."""
+        return "/" if self.auth_cookie_secure else "/api/v1"
 
     @field_validator("upload_dir", mode="before")
     @classmethod

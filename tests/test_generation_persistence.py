@@ -36,8 +36,13 @@ class RecordingPersistence:
     async def mark_failed(self, record: FailedGeneration) -> None:
         self.events.append(("mark_failed", record))
 
-    async def list_successful(self, *, limit: int) -> tuple[StoredGeneration, ...]:
-        _ = limit
+    async def list_successful(
+        self,
+        *,
+        user_id: int | None,
+        limit: int,
+    ) -> tuple[StoredGeneration, ...]:
+        _ = user_id, limit
         return ()
 
 
@@ -151,6 +156,8 @@ def test_success_lifecycle_uses_one_generation_id_in_order() -> None:
     assert isinstance(pending, PendingGeneration)
     assert isinstance(success, SuccessfulGeneration)
     assert pending.generation_id == success.generation_id
+    assert pending.user_id is None
+    assert success.user_id is None
     assert pending.generation_id == response.json()["generation_id"]
     assert pending.created_at == datetime.fromisoformat(response.json()["created_at"])
     assert success.image_summary == "图片中可见一只白色帆布包。"
@@ -190,6 +197,8 @@ def test_model_failure_marks_same_generation_failed_and_preserves_error() -> Non
     assert isinstance(pending, PendingGeneration)
     assert isinstance(failure, FailedGeneration)
     assert failure.generation_id == pending.generation_id
+    assert pending.user_id is None
+    assert failure.user_id is None
     assert failure.error_code == "MODEL_FAILED"
     assert failure.failed_at.tzinfo is not None
 

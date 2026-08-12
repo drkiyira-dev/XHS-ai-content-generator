@@ -67,7 +67,16 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build frontend
+      - name: Build frontend in compatibility mode
+        env:
+          VITE_AUTH_ENABLED: "false"
+          VITE_USE_MOCK: "false"
+        run: npm run build
+
+      - name: Build frontend in account mode
+        env:
+          VITE_AUTH_ENABLED: "true"
+          VITE_USE_MOCK: "false"
         run: npm run build
 
   backend-container-smoke:
