@@ -34,6 +34,18 @@ services:
         source: ./migrations/002_create_app_user.sh
         target: /docker-entrypoint-initdb.d/002_create_app_user.sh
         read_only: true
+      - type: bind
+        source: ./migrations/003_auth_tables.sql
+        target: /docker-entrypoint-initdb.d/003_auth_tables.sql
+        read_only: true
+      - type: bind
+        source: ./migrations/004_generation_ownership.sql
+        target: /docker-entrypoint-initdb.d/004_generation_ownership.sql
+        read_only: true
+      - type: bind
+        source: ./migrations/005_generation_previews_and_deletion.sql
+        target: /docker-entrypoint-initdb.d/005_generation_previews_and_deletion.sql
+        read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
       - /var/run/mysqld:rw,noexec,nosuid,nodev,size=16m,uid=999,gid=999,mode=0750
@@ -75,6 +87,8 @@ services:
         restart: true
     environment:
       DATABASE_ENABLED: "true"
+      AUTH_ENABLED: "false"
+      AUTH_COOKIE_SECURE: "false"
       UPLOAD_DIR: /run/xhs/uploads
     secrets:
       - source: siliconflow_api_key

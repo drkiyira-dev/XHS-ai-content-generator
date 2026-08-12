@@ -7,3 +7,6 @@ from backend.api.v1.generations import router as generations_router
 
 router = APIRouter()
 router.include_router(generations_router)
+
+
+__all__ = ["router"]

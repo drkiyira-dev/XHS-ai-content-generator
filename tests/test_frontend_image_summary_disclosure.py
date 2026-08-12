@@ -1,4 +1,4 @@
-"""Static regression checks for image-summary disclosure controls."""
+"""Static regression checks for routed image-summary disclosure controls."""
 
 from pathlib import Path
 import re
@@ -6,6 +6,8 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_VUE = ROOT / "frontend" / "src" / "App.vue"
+GENERATE_VIEW = ROOT / "frontend" / "src" / "views" / "GenerateView.vue"
+HISTORY_VIEW = ROOT / "frontend" / "src" / "views" / "HistoryView.vue"
 
 
 def _disclosure_for(source: str, binding: str) -> str:
@@ -21,11 +23,24 @@ def _disclosure_for(source: str, binding: str) -> str:
     return match.group(0)
 
 
-def test_current_and_history_summaries_use_native_closed_disclosures() -> None:
-    source = APP_VUE.read_text(encoding="utf-8")
+def _function_body(source: str, function_name: str) -> str:
+    match = re.search(
+        rf"^(?P<indent>[ \t]*)(?:async\s+)?function {function_name}"
+        rf"\([^)]*\)(?:\s*:\s*[^{{\n]+)?\s*\{{"
+        rf"(?P<body>.*?)^(?P=indent)\}}",
+        source,
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    assert match is not None, function_name
+    return match.group("body")
 
-    current = _disclosure_for(source, "result.image_summary")
-    history = _disclosure_for(source, "item.image_summary")
+
+def test_current_and_history_summaries_use_native_closed_disclosures() -> None:
+    generate_source = GENERATE_VIEW.read_text(encoding="utf-8")
+    history_source = HISTORY_VIEW.read_text(encoding="utf-8")
+
+    current = _disclosure_for(generate_source, "result.image_summary")
+    history = _disclosure_for(history_source, "item.image_summary")
 
     for disclosure in (current, history):
         opening_tag = disclosure.split(">", 1)[0]
@@ -40,30 +55,28 @@ def test_current_and_history_summaries_use_native_closed_disclosures() -> None:
 
 
 def test_summary_text_is_safely_rendered_and_does_not_change_copy_contract() -> None:
-    source = APP_VUE.read_text(encoding="utf-8")
+    app_source = APP_VUE.read_text(encoding="utf-8")
+    generate_source = GENERATE_VIEW.read_text(encoding="utf-8")
+    history_source = HISTORY_VIEW.read_text(encoding="utf-8")
 
-    assert "{{ result.image_summary }}" in source
-    assert "{{ item.image_summary }}" in source
-    assert "v-html" not in source
-    assert "innerHTML" not in source
+    assert "{{ result.image_summary }}" in generate_source
+    assert "{{ item.image_summary }}" in history_source
+    for source in (generate_source, history_source):
+        assert "v-html" not in source
+        assert "innerHTML" not in source
 
-    copy_match = re.search(
-        r"async function copyGeneration\([^)]*\).*?\{(.*?)\n\}",
-        source,
-        flags=re.DOTALL,
-    )
-    assert copy_match is not None
-    assert "generation.title" in copy_match.group(1)
-    assert "generation.body" in copy_match.group(1)
-    assert "generation.tags" in copy_match.group(1)
-    assert "generation.image_summary" not in copy_match.group(1)
+    copy_generation = _function_body(app_source, "copyGeneration")
+    assert "generation.title" in copy_generation
+    assert "generation.body" in copy_generation
+    assert "generation.tags" in copy_generation
+    assert "generation.image_summary" not in copy_generation
 
 
-def test_disclosure_has_mobile_safe_text_and_keyboard_focus_styles() -> None:
-    source = APP_VUE.read_text(encoding="utf-8")
-
-    assert ".image-summary-details summary" in source
-    assert "min-height: 44px" in source
-    assert ".image-summary-details summary:focus-visible" in source
-    assert "white-space: pre-wrap" in source
-    assert "overflow-wrap: anywhere" in source
+def test_disclosures_have_mobile_safe_text_and_keyboard_focus_styles() -> None:
+    for path in (GENERATE_VIEW, HISTORY_VIEW):
+        source = path.read_text(encoding="utf-8")
+        assert ".image-summary-details summary" in source
+        assert "min-height: 44px" in source
+        assert ".image-summary-details summary:focus-visible" in source
+        assert "white-space: pre-wrap" in source
+        assert "overflow-wrap: anywhere" in source

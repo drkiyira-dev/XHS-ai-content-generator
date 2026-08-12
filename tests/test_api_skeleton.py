@@ -5,6 +5,7 @@ from datetime import datetime
 from unittest.mock import Mock
 from uuid import UUID
 
+import httpx
 import pytest
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -72,8 +73,7 @@ def test_openapi_marks_image_as_a_binary_multipart_file() -> None:
     schema = build_test_app().openapi()
     operation = schema["paths"]["/api/v1/generations"]["post"]
     multipart_schema = operation["requestBody"]["content"]["multipart/form-data"]
-    reference = multipart_schema["schema"]["$ref"].rsplit("/", 1)[-1]
-    body_schema = schema["components"]["schemas"][reference]
+    body_schema = multipart_schema["schema"]
     image_schema = body_schema["properties"]["image"]
 
     assert "image" in body_schema["required"]
@@ -81,10 +81,129 @@ def test_openapi_marks_image_as_a_binary_multipart_file() -> None:
     assert image_schema["format"] == "binary"
     assert "HEIC" in image_schema["description"]
     assert "HEIF" in image_schema["description"]
+    assert "user_id" not in str(operation)
     error_schema_reference = operation["responses"]["502"]["content"][
         "application/json"
     ]["schema"]["$ref"]
     assert error_schema_reference.endswith("/ErrorResponse")
+
+
+def test_unauthenticated_generation_rejects_before_reading_multipart() -> None:
+    class BodyThatMustNotBeRead(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.was_read = False
+
+        async def __aiter__(self):
+            self.was_read = True
+            raise AssertionError("authentication must run before multipart parsing")
+            yield b""  # pragma: no cover
+
+    application = build_test_app(
+        DATABASE_ENABLED=True,
+        DATABASE_URL="mysql+pymysql://test:test@127.0.0.1/xhs_test",
+        AUTH_ENABLED=True,
+    )
+    body = BodyThatMustNotBeRead()
+    response = asyncio.run(
+        send_request(
+            "POST",
+            "/api/v1/generations",
+            application=application,
+            authenticated=False,
+            content=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=unread-body",
+            },
+        )
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "AUTH_REQUIRED"
+    assert body.was_read is False
+
+
+def test_authenticated_generation_requires_csrf_before_reading_multipart() -> None:
+    class BodyThatMustNotBeRead(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.was_read = False
+
+        async def __aiter__(self):
+            self.was_read = True
+            raise AssertionError("CSRF must run before multipart parsing")
+            yield b""  # pragma: no cover
+
+    application = build_test_app(
+        DATABASE_ENABLED=True,
+        DATABASE_URL="mysql+pymysql://test:test@127.0.0.1/xhs_test",
+        AUTH_ENABLED=True,
+    )
+    body = BodyThatMustNotBeRead()
+    response = asyncio.run(
+        send_request(
+            "POST",
+            "/api/v1/generations",
+            application=application,
+            csrf=False,
+            content=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=unread-body",
+            },
+        )
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "CSRF_REJECTED"
+    assert body.was_read is False
+
+
+def test_unauthenticated_history_rejects_without_calling_persistence() -> None:
+    generation_persistence = Mock()
+    application = build_test_app(
+        generation_persistence=generation_persistence,
+        DATABASE_ENABLED=True,
+        DATABASE_URL="mysql+pymysql://test:test@127.0.0.1/xhs_test",
+        AUTH_ENABLED=True,
+    )
+
+    response = asyncio.run(
+        send_request(
+            "GET",
+            "/api/v1/generations",
+            application=application,
+            authenticated=False,
+        )
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "AUTH_REQUIRED"
+    assert generation_persistence.method_calls == []
+
+
+def test_authenticated_generation_rejects_a_form_user_id_without_writing() -> None:
+    model_service = Mock()
+    generation_persistence = Mock()
+    application = build_test_app(
+        model_service=model_service,
+        generation_persistence=generation_persistence,
+        DATABASE_ENABLED=True,
+        DATABASE_URL="mysql+pymysql://test:test@127.0.0.1/xhs_test",
+        AUTH_ENABLED=True,
+    )
+
+    response = asyncio.run(
+        send_request(
+            "POST",
+            "/api/v1/generations",
+            application=application,
+            files={"image": ("sample.png", make_image_bytes(), "image/png")},
+            data={"user_id": "202"},
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_FORM_DATA"
+    assert generation_persistence.method_calls == []
+    assert model_service.method_calls == []
 
 
 def test_text_part_is_not_accepted_as_an_uploaded_image() -> None:
@@ -261,7 +380,7 @@ def test_actual_post_from_configured_origin_gets_cors_permission_header() -> Non
     assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
 
 
-def test_actual_post_from_unconfigured_origin_gets_no_cors_permission_header() -> None:
+def test_legacy_post_from_unconfigured_origin_gets_no_cors_permission_header() -> None:
     response = asyncio.run(
         send_request(
             "POST",

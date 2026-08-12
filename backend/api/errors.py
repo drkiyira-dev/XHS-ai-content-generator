@@ -1,5 +1,7 @@
 """Stable public API error responses."""
 
+from collections.abc import Mapping
+
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import (
     http_exception_handler,
@@ -36,12 +38,14 @@ class APIError(Exception):
         message: str,
         status_code: int,
         retryable: bool = False,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status_code = status_code
         self.retryable = retryable
+        self.headers = dict(headers) if headers is not None else None
 
     def payload(self) -> ErrorResponse:
         """Build the frozen public error structure."""
@@ -59,7 +63,11 @@ def register_exception_handlers(application: FastAPI) -> None:
 
     @application.exception_handler(APIError)
     async def handle_api_error(_request: Request, error: APIError) -> JSONResponse:
-        return JSONResponse(status_code=error.status_code, content=error.payload())
+        return JSONResponse(
+            status_code=error.status_code,
+            content=error.payload(),
+            headers=error.headers,
+        )
 
     @application.exception_handler(StarletteHTTPException)
     async def handle_http_exception(
@@ -83,6 +91,26 @@ def register_exception_handlers(application: FastAPI) -> None:
         request: Request,
         error: RequestValidationError,
     ):
+        if request.url.path == "/api/v1/auth/register":
+            api_error = APIError(
+                code="AUTH_INPUT_INVALID",
+                message="注册信息无效，请检查后重试。",
+                status_code=400,
+            )
+            return JSONResponse(
+                status_code=api_error.status_code,
+                content=api_error.payload(),
+            )
+        if request.url.path == "/api/v1/auth/login":
+            api_error = APIError(
+                code="INVALID_CREDENTIALS",
+                message="邮箱或密码错误。",
+                status_code=401,
+            )
+            return JSONResponse(
+                status_code=api_error.status_code,
+                content=api_error.payload(),
+            )
         missing_image = any(
             item.get("type") == "missing"
             and tuple(item.get("loc", ()))[-2:] == ("body", "image")

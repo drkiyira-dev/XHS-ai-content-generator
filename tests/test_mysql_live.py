@@ -75,6 +75,7 @@ def test_real_mysql_generation_lifecycle(
         _env_file=ENV_FILE,
     )
     assert settings.database_enabled is True
+    assert settings.auth_enabled is False
     database_url = _load_expected_database_url(settings)
 
     engine = create_engine(
@@ -113,6 +114,7 @@ def test_real_mysql_generation_lifecycle(
 
         success_record = _load_record(factory, str(success_id))
         assert success_record is not None
+        assert success_record.user_id is None
         assert success_record.status == "success"
         assert success_record.title == success_response.json()["title"]
         assert success_record.content == success_response.json()["body"]
@@ -129,6 +131,7 @@ def test_real_mysql_generation_lifecycle(
 
         failed_record = _load_record(factory, str(failed_id))
         assert failed_record is not None
+        assert failed_record.user_id is None
         assert failed_record.status == "failed"
         assert failed_record.error_code == "MODEL_FAILED"
         assert failed_record.error_message is None
@@ -149,6 +152,7 @@ def test_real_mysql_generation_lifecycle(
         assert race_status in {"success", "failed"}
         race_record = _load_record(factory, str(race_id))
         assert race_record is not None
+        assert race_record.user_id is None
         assert race_record.status == race_status
         if race_status == "success":
             assert race_record.title == "MySQL并发测试"
@@ -255,10 +259,15 @@ async def _exercise_terminal_race(
         await runtime.startup()
         persistence = runtime.persistence
         await persistence.create_pending(
-            PendingGeneration(str(generation_id), datetime.now(UTC))
+            PendingGeneration(
+                generation_id=str(generation_id),
+                user_id=None,
+                created_at=datetime.now(UTC),
+            )
         )
         success = SuccessfulGeneration(
             generation_id=str(generation_id),
+            user_id=None,
             image_summary="MySQL 并发测试图片",
             title="MySQL并发测试",
             body="用于验证 pending 只能进入一个终态。",
@@ -266,6 +275,7 @@ async def _exercise_terminal_race(
         )
         failed = FailedGeneration(
             generation_id=str(generation_id),
+            user_id=None,
             error_code="MODEL_FAILED",
             failed_at=datetime.now(UTC),
         )

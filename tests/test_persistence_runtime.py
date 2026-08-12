@@ -14,7 +14,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import backend.app as app_module
 import backend.services.persistence.runtime as runtime_module
-from backend.db import Base
+from backend.db import AuthSession, Base, GenerationRecord, User
+from backend.services.auth import SQLAlchemyAuthStore
 from backend.services.persistence import (
     GenerationPersistence,
     NoOpGenerationPersistence,
@@ -253,6 +254,39 @@ def test_runtime_factory_sets_bounded_and_private_engine_options(
         "local_infile": False,
     }
     assert "test-only-password" not in repr(captured)
+
+
+def test_runtime_factory_shares_one_session_factory_and_limiter_with_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EngineDouble:
+        def dispose(self) -> None:
+            return None
+
+    fake_engine = cast(Engine, EngineDouble())
+    monkeypatch.setattr(
+        runtime_module,
+        "create_engine",
+        lambda *_args, **_kwargs: fake_engine,
+    )
+    settings = build_test_app(
+        DATABASE_ENABLED=True,
+        DATABASE_URL=DATABASE_URL,
+    ).state.settings
+
+    runtime = create_sqlalchemy_persistence_runtime(
+        settings,
+        require_generation=True,
+        require_auth=True,
+    )
+
+    assert isinstance(runtime.auth_store, SQLAlchemyAuthStore)
+    assert (
+        runtime.persistence._session_factory
+        is runtime.auth_store._session_factory
+    )
+    assert runtime.persistence._limiter is runtime.auth_store._limiter
+    assert runtime.persistence._limiter is runtime._limiter
 
 
 def test_remote_runtime_enables_certificate_and_identity_verification(
@@ -511,6 +545,509 @@ def test_runtime_probe_requires_a_preexisting_table_and_never_creates_it(
         await second_runtime.aclose()
 
     asyncio.run(accepted_after_schema_exists())
+
+
+def test_generation_only_probe_requires_owner_column_but_not_auth_tables(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'generation-only.sqlite3'}",
+        connect_args={"check_same_thread": False},
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE generation_records ("
+            "id INTEGER PRIMARY KEY, user_id INTEGER NULL, "
+            "image_preview BLOB NULL, "
+            "image_preview_media_type TEXT NULL, "
+            "deleted_at TEXT NULL)"
+        )
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+        require_generation=True,
+        require_auth=False,
+    )
+
+    async def exercise() -> None:
+        await runtime.startup()
+        await runtime.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "missing_column",
+    ["image_preview", "image_preview_media_type", "deleted_at"],
+)
+def test_generation_probe_rejects_each_missing_history_lifecycle_column(
+    tmp_path: Path,
+    missing_column: str,
+) -> None:
+    columns = {
+        "image_preview": "image_preview BLOB NULL",
+        "image_preview_media_type": "image_preview_media_type TEXT NULL",
+        "deleted_at": "deleted_at TEXT NULL",
+    }
+    selected = [
+        definition
+        for name, definition in columns.items()
+        if name != missing_column
+    ]
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / f'missing-{missing_column}.sqlite3'}",
+        connect_args={"check_same_thread": False},
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE generation_records ("
+            "id INTEGER PRIMARY KEY, user_id INTEGER NULL, "
+            + ", ".join(selected)
+            + ")"
+        )
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(DatabaseStartupError):
+            await runtime.startup()
+        await runtime.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "column_name,column_type",
+    [
+        ("image_preview", "BLOB"),
+        ("image_preview_media_type", "TEXT"),
+        ("deleted_at", "TEXT"),
+    ],
+)
+def test_generation_probe_rejects_non_nullable_history_lifecycle_columns(
+    tmp_path: Path,
+    column_name: str,
+    column_type: str,
+) -> None:
+    definitions = {
+        "image_preview": "image_preview BLOB NULL",
+        "image_preview_media_type": "image_preview_media_type TEXT NULL",
+        "deleted_at": "deleted_at TEXT NULL",
+    }
+    definitions[column_name] = f"{column_name} {column_type} NOT NULL"
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / f'non-null-{column_name}.sqlite3'}",
+        connect_args={"check_same_thread": False},
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE generation_records ("
+            "id INTEGER PRIMARY KEY, user_id INTEGER NULL, "
+            + ", ".join(definitions.values())
+            + ")"
+        )
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(DatabaseStartupError):
+            await runtime.startup()
+        await runtime.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_generation_only_probe_rejects_the_pre_ownership_schema(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'pre-ownership.sqlite3'}",
+        connect_args={"check_same_thread": False},
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE generation_records (id INTEGER PRIMARY KEY)"
+        )
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+        require_generation=True,
+        require_auth=False,
+    )
+
+    async def exercise() -> DatabaseStartupError:
+        with pytest.raises(DatabaseStartupError) as caught:
+            await runtime.startup()
+        await runtime.aclose()
+        return caught.value
+
+    error = asyncio.run(exercise())
+
+    assert str(error) == "database startup verification failed"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_generation_only_probe_rejects_a_non_nullable_owner_column(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'non-null-owner.sqlite3'}",
+        connect_args={"check_same_thread": False},
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE generation_records ("
+            "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL)"
+        )
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+        require_generation=True,
+        require_auth=False,
+    )
+
+    async def exercise() -> DatabaseStartupError:
+        with pytest.raises(DatabaseStartupError) as caught:
+            await runtime.startup()
+        await runtime.aclose()
+        return caught.value
+
+    error = asyncio.run(exercise())
+
+    assert str(error) == "database startup verification failed"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_auth_probe_accepts_complete_ownership_schema_when_adapter_is_injected(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'auth-only.sqlite3'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    auth_store = SQLAlchemyAuthStore(factory, limiter=limiter)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+        auth_store=auth_store,
+        require_generation=False,
+        require_auth=True,
+    )
+
+    async def exercise() -> None:
+        await runtime.startup()
+        await runtime.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "schema_defect",
+    [
+        "missing_owner_column",
+        "missing_owner_foreign_key",
+        "missing_owner_index",
+        "wrong_owner_index_order",
+    ],
+)
+def test_auth_probe_rejects_incomplete_generation_ownership(
+    tmp_path: Path,
+    schema_defect: str,
+) -> None:
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / f'unsafe-owner-{schema_defect}.sqlite3'}",
+        connect_args={"check_same_thread": False},
+    )
+    owner_column = (
+        "" if schema_defect == "missing_owner_column" else "user_id INTEGER,"
+    )
+    owner_foreign_key = (
+        ""
+        if schema_defect in {"missing_owner_column", "missing_owner_foreign_key"}
+        else ", FOREIGN KEY (user_id) REFERENCES users (id)"
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                is_active INTEGER NOT NULL,
+                email_verified_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_login_at TEXT
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE auth_sessions (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                token_hash BLOB NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            f"""
+            CREATE TABLE generation_records (
+                id INTEGER PRIMARY KEY,
+                {owner_column}
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+                {owner_foreign_key}
+            )
+            """
+        )
+        if schema_defect not in {
+            "missing_owner_column",
+            "missing_owner_index",
+        }:
+            index_columns = (
+                "status, user_id, created_at"
+                if schema_defect == "wrong_owner_index_order"
+                else "user_id, status, created_at"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX ix_generation_records_owner_test "
+                f"ON generation_records ({index_columns})"
+            )
+
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+        auth_store=SQLAlchemyAuthStore(factory, limiter=limiter),
+        require_generation=False,
+        require_auth=True,
+    )
+
+    async def rejected() -> DatabaseStartupError:
+        with pytest.raises(DatabaseStartupError) as caught:
+            await runtime.startup()
+        await runtime.aclose()
+        return caught.value
+
+    error = asyncio.run(rejected())
+
+    assert str(error) == "database startup verification failed"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize("missing_table", ["users", "auth_sessions"])
+def test_auth_probe_rejects_each_missing_auth_table(
+    tmp_path: Path,
+    missing_table: str,
+) -> None:
+    database_path = tmp_path / f"missing-{missing_table}.sqlite3"
+    engine = create_engine(
+        f"sqlite+pysqlite:///{database_path}",
+        connect_args={"check_same_thread": False},
+    )
+    GenerationRecord.__table__.create(engine)
+    if missing_table == "auth_sessions":
+        User.__table__.create(engine)
+    elif missing_table == "users":
+        # SQLite permits creating the child table before its referenced table,
+        # which lets this test isolate the missing parent-table probe.
+        AuthSession.__table__.create(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    auth_store = SQLAlchemyAuthStore(factory, limiter=limiter)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+        auth_store=auth_store,
+        require_generation=True,
+        require_auth=True,
+    )
+
+    async def exercise() -> DatabaseStartupError:
+        with pytest.raises(DatabaseStartupError) as caught:
+            await runtime.startup()
+        await runtime.aclose()
+        return caught.value
+
+    error = asyncio.run(exercise())
+
+    assert str(error) == "database startup verification failed"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_auth_probe_never_creates_missing_tables(tmp_path: Path) -> None:
+    database_path = tmp_path / "no-auth-ddl.sqlite3"
+    engine = create_engine(
+        f"sqlite+pysqlite:///{database_path}",
+        connect_args={"check_same_thread": False},
+    )
+    GenerationRecord.__table__.create(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+        auth_store=SQLAlchemyAuthStore(factory, limiter=limiter),
+        require_generation=True,
+        require_auth=True,
+    )
+
+    async def rejected() -> None:
+        with pytest.raises(DatabaseStartupError):
+            await runtime.startup()
+        await runtime.aclose()
+
+    asyncio.run(rejected())
+
+    verification_engine = create_engine(
+        f"sqlite+pysqlite:///{database_path}",
+        connect_args={"check_same_thread": False},
+    )
+    try:
+        assert set(inspect(verification_engine).get_table_names()) == {
+            "generation_records"
+        }
+    finally:
+        verification_engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "schema_defect",
+    [
+        "missing_user_column",
+        "missing_session_column",
+        "email_not_unique",
+        "token_hash_not_unique",
+        "missing_user_foreign_key",
+    ],
+)
+def test_auth_probe_rejects_incomplete_or_unsafe_table_shells(
+    tmp_path: Path,
+    schema_defect: str,
+) -> None:
+    database_path = tmp_path / f"unsafe-auth-{schema_defect}.sqlite3"
+    engine = create_engine(
+        f"sqlite+pysqlite:///{database_path}",
+        connect_args={"check_same_thread": False},
+    )
+    user_password_column = (
+        "" if schema_defect == "missing_user_column" else "password_hash TEXT NOT NULL,"
+    )
+    email_unique = "" if schema_defect == "email_not_unique" else "UNIQUE"
+    session_expiry_column = (
+        "" if schema_defect == "missing_session_column" else "expires_at TEXT NOT NULL,"
+    )
+    token_unique = "" if schema_defect == "token_hash_not_unique" else "UNIQUE"
+    user_foreign_key = (
+        ""
+        if schema_defect == "missing_user_foreign_key"
+        else ", FOREIGN KEY (user_id) REFERENCES users (id)"
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f"""
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                email TEXT NOT NULL {email_unique},
+                {user_password_column}
+                is_active INTEGER NOT NULL,
+                email_verified_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_login_at TEXT
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE generation_records (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            CREATE INDEX ix_generation_records_user_status_created
+            ON generation_records (user_id, status, created_at)
+            """
+        )
+        connection.exec_driver_sql(
+            f"""
+            CREATE TABLE auth_sessions (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                token_hash BLOB NOT NULL {token_unique},
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                {session_expiry_column}
+                revoked_at TEXT
+                {user_foreign_key}
+            )
+            """
+        )
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+        auth_store=SQLAlchemyAuthStore(factory, limiter=limiter),
+        require_generation=False,
+        require_auth=True,
+    )
+
+    async def rejected() -> DatabaseStartupError:
+        with pytest.raises(DatabaseStartupError) as caught:
+            await runtime.startup()
+        await runtime.aclose()
+        return caught.value
+
+    error = asyncio.run(rejected())
+
+    assert str(error) == "database startup verification failed"
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_mysql_migration_is_scoped_to_one_preselected_database() -> None:

@@ -1,15 +1,32 @@
 <script setup lang="ts">
-import { ref, reactive } from 'vue'
-import { ElMessage } from 'element-plus'
-import type { UploadInstance } from 'element-plus'
-import { DocumentCopy, RefreshRight, Delete } from '@element-plus/icons-vue'
-import LandingPage from './components/LandingPage.vue'
 import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  provide,
+  reactive,
+  ref,
+  watch
+} from 'vue'
+import { ElMessage } from 'element-plus'
+import type { UploadFile } from 'element-plus'
+import { Reading } from '@element-plus/icons-vue'
+import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
+
+import AuthDialog from './components/AuthDialog.vue'
+import { AUTH_ENABLED } from './services/api'
+import {
+  deleteGeneration,
   generate,
   listGenerations,
+  type GenerationHistoryItem,
   type GenerationResponse,
   GenerationError
 } from './services/generation'
+import { readSafeNext, type ProtectedRouteName } from './router'
+import { authSession, type AuthMode } from './state/auth'
+import { WORKSPACE_KEY, type HistoryStatus } from './state/workspace'
 
 // ===== 页面状态 =====
 // idle: 空闲
@@ -21,16 +38,34 @@ const status = ref<Status>('idle')
 const errorMessage = ref('')
 const errorRetryable = ref(false)
 
-// ===== 页面切换与历史记录状态 =====
-type ActiveView = 'home' | 'generate' | 'history'
-type HistoryStatus = 'idle' | 'loading' | 'success' | 'error'
+// ===== 路由与账号状态 =====
+const route = useRoute()
+const router = useRouter()
+const authStatus = authSession.status
+const currentUser = authSession.user
+const authBusy = authSession.busy
+const authError = authSession.error
+const authRevision = authSession.revision
+const authDialogOpen = computed(
+  () => AUTH_ENABLED && (route.name === 'login' || route.name === 'register')
+)
+const authMode = computed<AuthMode>(() => route.name === 'register' ? 'register' : 'login')
+
+let generationRequestId = 0
+let historyRequestId = 0
+let imageSelectionId = 0
+let historyDeleteSequence = 0
+let previousRouteName = route.name
+
+// ===== 历史记录状态 =====
 const HISTORY_LIMIT = 20
-const activeView = ref<ActiveView>('home')
 const historyStatus = ref<HistoryStatus>('idle')
-const historyItems = ref<GenerationResponse[]>([])
+const historyItems = ref<GenerationHistoryItem[]>([])
 const historyCount = ref(0)
 const historyError = ref('')
 const historyLoaded = ref(false)
+const historyDeletingIds = ref<Set<string>>(new Set())
+const historyDeleteTokens = new Map<string, number>()
 let historyRevision = 0
 
 // ===== 用户输入 =====
@@ -44,7 +79,8 @@ const form = reactive({
 const imageFile = ref<File | null>(null)
 const imagePreviewUrl = ref('')
 const imageIsHeif = ref(false)
-const uploadRef = ref<UploadInstance>()
+const imageResetEpoch = ref(0)
+const restoredFromHistory = ref(false)
 
 // 常量配置
 type SupportedImageFormat = 'JPEG' | 'PNG' | 'WEBP' | 'HEIF'
@@ -159,8 +195,10 @@ function detectImageFormat(file: File): Promise<SupportedImageFormat | null> {
 }
 
 // 用户选择图片后触发
-async function handleImageChange(file: any) {
+async function handleImageChange(file: UploadFile) {
+  const selectionId = ++imageSelectionId
   // 重置状态
+  restoredFromHistory.value = false
   status.value = 'idle'
   errorMessage.value = ''
   errorRetryable.value = false
@@ -199,6 +237,9 @@ async function handleImageChange(file: any) {
 
   // 4. 校验文件头（防止改扩展名）
   const detectedFormat = await detectImageFormat(raw)
+  if (selectionId !== imageSelectionId) {
+    return
+  }
   if (!detectedFormat || detectedFormat !== extensionFormat) {
     ElMessage.error('文件内容不是真实图片，请勿修改扩展名后上传')
     clearImage()
@@ -214,12 +255,16 @@ async function handleImageChange(file: any) {
 
 // 清空图片和结果
 function clearImage() {
-  // 同步清空 el-upload 的内部队列，避免 limit=1 阻止再次选择。
-  uploadRef.value?.clearFiles()
+  imageSelectionId += 1
+  // 通知当前生成页清空 el-upload 的内部队列，避免 limit=1 阻止再次选择。
+  imageResetEpoch.value += 1
   imageFile.value = null
   imageIsHeif.value = false
+  restoredFromHistory.value = false
   if (imagePreviewUrl.value) {
-    URL.revokeObjectURL(imagePreviewUrl.value)
+    if (imagePreviewUrl.value.startsWith('blob:')) {
+      URL.revokeObjectURL(imagePreviewUrl.value)
+    }
     imagePreviewUrl.value = ''
   }
   status.value = 'idle'
@@ -237,8 +282,133 @@ const result = reactive<GenerationResponse>({
   created_at: ''
 })
 
+function clearGenerationResult() {
+  Object.assign(result, {
+    generation_id: '',
+    image_summary: '',
+    title: '',
+    body: '',
+    tags: [],
+    created_at: ''
+  })
+}
+
+function resetAccountScopedState() {
+  generationRequestId += 1
+  historyRequestId += 1
+  historyDeleteSequence += 1
+  historyDeleteTokens.clear()
+  historyRevision += 1
+  clearImage()
+  clearGenerationResult()
+  form.productName = ''
+  form.targetAudience = ''
+  form.tone = ''
+  historyItems.value = []
+  historyCount.value = 0
+  historyError.value = ''
+  historyLoaded.value = false
+  historyDeletingIds.value = new Set()
+  historyStatus.value = 'idle'
+}
+
+function authDestination(): ProtectedRouteName {
+  return readSafeNext(route.query.next) ?? 'generate'
+}
+
+function openAuth(mode: AuthMode, destination: ProtectedRouteName | null = null): void {
+  const query = destination === null ? {} : { next: destination }
+  void router.push({ name: mode, query })
+}
+
+function closeAuthDialog(): void {
+  if (authBusy.value || authStatus.value === 'restoring') {
+    return
+  }
+  // 成功登录后的路由跳转会令 el-dialog 正常关闭并触发 close 事件。
+  // 此时已经离开认证路由，不能让迟到的关闭事件再把目标页面覆盖成首页。
+  if (route.name !== 'login' && route.name !== 'register') {
+    return
+  }
+  authError.value = ''
+  void router.replace({ name: 'home' })
+}
+
+function switchAuthMode(mode: AuthMode): void {
+  authError.value = ''
+  const next = readSafeNext(route.query.next)
+  void router.replace({
+    name: mode,
+    query: next === null ? {} : { next }
+  })
+}
+
+async function retryAccountSession(): Promise<void> {
+  await authSession.retry()
+  if (authStatus.value === 'authenticated' && authDialogOpen.value) {
+    await router.replace({ name: authDestination() })
+  }
+}
+
+function handleSessionExpired(destination: ProtectedRouteName): void {
+  authSession.expire()
+  void router.replace({
+    name: 'login',
+    query: { next: destination }
+  })
+}
+
+async function handleAuthSubmit(credentials: { email: string; password: string }): Promise<void> {
+  const submittedRoute = route.fullPath
+  const submittedMode = authMode.value
+  const destination = authDestination()
+  let email = credentials.email
+  let password = credentials.password
+  credentials.email = ''
+  credentials.password = ''
+  try {
+    const succeeded = await authSession.submit(submittedMode, email, password)
+    if (!succeeded) {
+      return
+    }
+
+    // 浏览器后退或另一条认证导航可能在请求期间改变 URL。账号状态可以安全
+    // 安装为最新响应，但只有仍停留在认证页时才继续导航；此时目的地必须从
+    // 当前 URL 的白名单 next 重新读取，不能使用已经过时的任意路径快照。
+    if (route.fullPath !== submittedRoute) {
+      if (route.name === 'login' || route.name === 'register') {
+        await router.replace({ name: authDestination() })
+      }
+      return
+    }
+
+    await router.replace({ name: destination })
+    ElMessage.success(submittedMode === 'register' ? '注册成功，已登录。' : '登录成功。')
+  } finally {
+    email = ''
+    password = ''
+  }
+}
+
+async function handleLogout(): Promise<void> {
+  const succeeded = await authSession.logout()
+  if (succeeded) {
+    await router.replace({ name: 'home' })
+    ElMessage.success('已安全退出。')
+    return
+  }
+  if (authError.value) {
+    ElMessage.error(authError.value)
+  }
+}
+
 // ===== 点击生成 =====
 async function handleGenerate() {
+  if (AUTH_ENABLED && authStatus.value !== 'authenticated') {
+    openAuth('login', 'generate')
+    return
+  }
+
   // 1. 简单校验
   if (!imageFile.value) {
     ElMessage.warning('请先上传图片')
@@ -264,54 +434,56 @@ async function handleGenerate() {
     formData.append('tone', form.tone.trim())
   }
 
+  const requestId = ++generationRequestId
+  const requestedAuthRevision = authRevision.value
+  const requestedUserId = currentUser.value?.user_id ?? null
+
   // 4. 调用 service 层（默认真实接口；仅显式 VITE_USE_MOCK=true 时使用 Mock）
   try {
     const data = await generate(formData)
+    if (
+      requestId !== generationRequestId ||
+      requestedAuthRevision !== authRevision.value ||
+      requestedUserId !== (currentUser.value?.user_id ?? null)
+    ) {
+      return
+    }
     Object.assign(result, data)
     status.value = 'success'
     historyRevision += 1
     historyLoaded.value = false
-    if (activeView.value === 'history') {
+    if (route.name === 'history') {
       void loadHistory()
     }
-  } catch (err: any) {
+  } catch (err: unknown) {
+    if (
+      requestId !== generationRequestId ||
+      requestedAuthRevision !== authRevision.value ||
+      requestedUserId !== (currentUser.value?.user_id ?? null)
+    ) {
+      return
+    }
+    if (err instanceof GenerationError && err.code === 'AUTH_REQUIRED') {
+      handleSessionExpired('generate')
+      return
+    }
     status.value = 'error'
     if (err instanceof GenerationError) {
       errorMessage.value = err.message
       errorRetryable.value = err.retryable
     } else {
-      errorMessage.value = err.message || '生成失败，请重试'
+      errorMessage.value = '生成失败，请重试。'
       errorRetryable.value = false
     }
   }
 }
 
 // ===== 历史记录 =====
-async function showHistory() {
-  activeView.value = 'history'
-  requestAnimationFrame(() => {
-    document.getElementById('history-panel')?.scrollIntoView({ block: 'start' })
-  })
-  if (!historyLoaded.value) {
-    await loadHistory()
-  }
-}
-
-function showGenerator() {
-  activeView.value = 'generate'
-  requestAnimationFrame(() => {
-    document.getElementById('generator-panel')?.scrollIntoView({ block: 'start' })
-  })
-}
-
-function showHome() {
-  activeView.value = 'home'
-  requestAnimationFrame(() => {
-    document.getElementById('home-panel')?.scrollIntoView({ block: 'start' })
-  })
-}
-
 async function loadHistory() {
+  if (AUTH_ENABLED && authStatus.value !== 'authenticated') {
+    openAuth('login', 'history')
+    return
+  }
   if (historyStatus.value === 'loading') {
     return
   }
@@ -319,12 +491,24 @@ async function loadHistory() {
   historyStatus.value = 'loading'
   historyError.value = ''
   const requestedRevision = historyRevision
+  const requestedAuthRevision = authRevision.value
+  const requestedUserId = currentUser.value?.user_id ?? null
+  const requestId = ++historyRequestId
 
   try {
     const data = await listGenerations(HISTORY_LIMIT)
+    if (
+      requestId !== historyRequestId ||
+      requestedAuthRevision !== authRevision.value ||
+      requestedUserId !== (currentUser.value?.user_id ?? null)
+    ) {
+      return
+    }
     if (requestedRevision !== historyRevision) {
       historyStatus.value = 'idle'
-      await loadHistory()
+      if (route.name === 'history') {
+        void loadHistory()
+      }
       return
     }
 
@@ -333,9 +517,15 @@ async function loadHistory() {
     historyLoaded.value = true
     historyStatus.value = 'success'
   } catch (err: unknown) {
-    if (requestedRevision !== historyRevision) {
-      historyStatus.value = 'idle'
-      await loadHistory()
+    if (
+      requestId !== historyRequestId ||
+      requestedAuthRevision !== authRevision.value ||
+      requestedUserId !== (currentUser.value?.user_id ?? null)
+    ) {
+      return
+    }
+    if (err instanceof GenerationError && err.code === 'AUTH_REQUIRED') {
+      handleSessionExpired('history')
       return
     }
 
@@ -344,6 +534,102 @@ async function loadHistory() {
     historyError.value = err instanceof GenerationError
       ? err.message
       : '历史记录读取失败，请稍后重试'
+  }
+}
+
+async function restoreHistoryItem(generation: GenerationHistoryItem): Promise<void> {
+  // A history restore is a newer workspace action than any pending model call.
+  // Invalidating first prevents a delayed generation response from replacing it.
+  generationRequestId += 1
+  clearImage()
+  clearGenerationResult()
+  form.productName = ''
+  form.targetAudience = ''
+  form.tone = ''
+  Object.assign(result, {
+    generation_id: generation.generation_id,
+    image_summary: generation.image_summary,
+    title: generation.title,
+    body: generation.body,
+    tags: [...generation.tags],
+    created_at: generation.created_at
+  })
+  imageFile.value = null
+  imagePreviewUrl.value = generation.has_image_preview
+    ? generation.image_preview_url ?? ''
+    : ''
+  imageIsHeif.value = false
+  restoredFromHistory.value = true
+  errorMessage.value = ''
+  errorRetryable.value = false
+  status.value = 'success'
+  await router.push({ name: 'generate' })
+}
+
+async function deleteHistoryItem(generation: GenerationHistoryItem): Promise<boolean> {
+  const generationId = generation.generation_id
+  if (
+    historyDeleteTokens.has(generationId) ||
+    !historyItems.value.some(item => item.generation_id === generationId)
+  ) {
+    return false
+  }
+
+  const token = ++historyDeleteSequence
+  historyDeleteTokens.set(generationId, token)
+  historyDeletingIds.value = new Set(historyDeletingIds.value).add(generationId)
+  const requestedAuthRevision = authRevision.value
+  const requestedUserId = currentUser.value?.user_id ?? null
+
+  try {
+    await deleteGeneration(generationId)
+    if (
+      historyDeleteTokens.get(generationId) !== token ||
+      requestedAuthRevision !== authRevision.value ||
+      requestedUserId !== (currentUser.value?.user_id ?? null)
+    ) {
+      return false
+    }
+
+    // Cancel a list request that may contain the now-deleted record, then
+    // install the successful local mutation without waiting for another fetch.
+    historyRequestId += 1
+    historyRevision += 1
+    historyItems.value = historyItems.value.filter(
+      item => item.generation_id !== generationId
+    )
+    historyCount.value = historyItems.value.length
+    historyLoaded.value = true
+    historyError.value = ''
+    historyStatus.value = 'success'
+    ElMessage.success('历史记录已删除。')
+    return true
+  } catch (err: unknown) {
+    if (
+      historyDeleteTokens.get(generationId) !== token ||
+      requestedAuthRevision !== authRevision.value ||
+      requestedUserId !== (currentUser.value?.user_id ?? null)
+    ) {
+      return false
+    }
+    if (err instanceof GenerationError && err.code === 'AUTH_REQUIRED') {
+      handleSessionExpired('history')
+      return false
+    }
+
+    ElMessage.error(
+      err instanceof GenerationError
+        ? err.message
+        : '历史记录删除失败，请稍后重试。'
+    )
+    return false
+  } finally {
+    if (historyDeleteTokens.get(generationId) === token) {
+      historyDeleteTokens.delete(generationId)
+      const nextDeletingIds = new Set(historyDeletingIds.value)
+      nextDeletingIds.delete(generationId)
+      historyDeletingIds.value = nextDeletingIds
+    }
   }
 }
 
@@ -378,333 +664,209 @@ async function copyGeneration(generation: GenerationResponse) {
 function copyAll() {
   void copyGeneration(result)
 }
+
+provide(WORKSPACE_KEY, {
+  status,
+  errorMessage,
+  errorRetryable,
+  form,
+  imageFile,
+  imagePreviewUrl,
+  imageIsHeif,
+  imageResetEpoch,
+  restoredFromHistory,
+  result,
+  handleImageChange,
+  clearImage,
+  handleGenerate,
+  copyAll,
+  historyStatus,
+  historyItems,
+  historyCount,
+  historyError,
+  historyLoaded,
+  historyDeletingIds,
+  historyLimit: HISTORY_LIMIT,
+  loadHistory,
+  restoreHistoryItem,
+  deleteHistoryItem,
+  formatCreatedAt,
+  copyGeneration
+})
+
+// Auth revision is the sole account-boundary signal. Route changes for the
+// same account do not touch the draft; logout, expiry and a different account
+// synchronously clear every private value and invalidate pending work.
+watch(authRevision, resetAccountScopedState, { flush: 'sync' })
+
+watch(
+  () => route.name,
+  async (name) => {
+    const shouldFocusPageTitle = previousRouteName !== undefined && previousRouteName !== name
+    previousRouteName = name
+    const titles: Record<string, string> = {
+      home: '图文种草助手 · 图片生成小红书内容初稿',
+      generate: '生成小红书内容 · 图文种草助手',
+      history: '历史记录 · 图文种草助手',
+      login: '登录 · 图文种草助手',
+      register: '注册 · 图文种草助手'
+    }
+    document.title = titles[String(name)] ?? titles.home
+    await nextTick()
+    // 首次完整页面加载由浏览器自然建立阅读起点；只有后续 SPA 导航才
+    // 主动把焦点移到新页面标题，避免首屏出现无来由的大块焦点轮廓。
+    if (shouldFocusPageTitle && name !== 'login' && name !== 'register') {
+      document.getElementById('page-title')?.focus({ preventScroll: true })
+    }
+  },
+  { immediate: true, flush: 'post' }
+)
+
+onMounted(() => {
+  void authSession.ensureRestored()
+})
+
+onBeforeUnmount(() => {
+  generationRequestId += 1
+  historyRequestId += 1
+  historyDeleteSequence += 1
+  historyDeleteTokens.clear()
+  imageSelectionId += 1
+  if (imagePreviewUrl.value) {
+    if (imagePreviewUrl.value.startsWith('blob:')) {
+      URL.revokeObjectURL(imagePreviewUrl.value)
+    }
+    imagePreviewUrl.value = ''
+  }
+})
 </script>
 
 <template>
-  <div class="app">
-    <header class="site-header">
-      <button type="button" class="brand" aria-label="返回产品首页" @click="showHome">
-        <span aria-hidden="true">图</span>
-        <strong>图文种草助手</strong>
-      </button>
+  <div class="app-shell">
+    <a class="skip-link" href="#page-title">跳到主要内容</a>
 
-      <nav class="view-switch" aria-label="页面导航">
-        <el-button
-          id="home-nav-button"
-          :type="activeView === 'home' ? 'primary' : 'default'"
-          :aria-pressed="activeView === 'home'"
-          aria-controls="home-panel"
-          @click="showHome"
-        >
-          产品首页
-        </el-button>
-        <el-button
-          id="generator-nav-button"
-          :type="activeView === 'generate' ? 'primary' : 'default'"
-          :aria-pressed="activeView === 'generate'"
-          aria-controls="generator-panel"
-          @click="showGenerator"
-        >
-          生成文案
-        </el-button>
-        <el-button
-          id="history-nav-button"
-          :type="activeView === 'history' ? 'primary' : 'default'"
-          :aria-pressed="activeView === 'history'"
-          aria-controls="history-panel"
-          @click="showHistory"
-        >
-          历史记录
-        </el-button>
-      </nav>
+    <header class="site-header">
+      <RouterLink class="brand" :to="{ name: 'home' }" aria-label="返回首页">
+        <span class="brand-mark" aria-hidden="true"><Reading /></span>
+        <strong>图文种草助手</strong>
+      </RouterLink>
+
+      <div class="header-controls">
+        <nav class="route-nav" aria-label="页面导航">
+          <RouterLink :to="{ name: 'home' }">首页</RouterLink>
+          <RouterLink :to="{ name: 'generate' }">生成文案</RouterLink>
+          <RouterLink :to="{ name: 'history' }">历史记录</RouterLink>
+        </nav>
+
+        <div class="account-actions">
+          <span
+            v-if="authStatus === 'disabled'"
+            class="account-mode-badge"
+            role="status"
+          >
+            免登录演示
+          </span>
+          <span
+            v-else-if="authStatus === 'restoring'"
+            class="account-status"
+            role="status"
+            aria-live="polite"
+          >
+            正在恢复会话...
+          </span>
+          <template v-else-if="authStatus === 'authenticated' && currentUser">
+            <span class="account-identity">
+              <strong>{{ currentUser.email }}</strong>
+              <small>{{ currentUser.email_verified ? '邮箱已验证' : '演示账号 · 邮箱未验证' }}</small>
+            </span>
+            <el-button :loading="authBusy" :disabled="authBusy" @click="handleLogout">
+              退出
+            </el-button>
+          </template>
+          <template v-else>
+            <span
+              v-if="authStatus === 'unavailable'"
+              class="account-status account-status--warning"
+              role="status"
+            >
+              账号服务不可用
+            </span>
+            <RouterLink class="account-link" :to="{ name: 'login' }">登录</RouterLink>
+            <RouterLink class="account-link account-link--primary" :to="{ name: 'register' }">
+              注册
+            </RouterLink>
+          </template>
+        </div>
+      </div>
     </header>
 
-    <main class="site-main">
-      <LandingPage v-show="activeView === 'home'" @start="showGenerator" />
-
-      <div v-show="activeView !== 'home'" class="workspace-heading">
-        <h1 class="title">小红书文案生成平台</h1>
-        <p class="subtitle">上传一张图，AI 帮你写小红书内容初稿</p>
-      </div>
-
-    <section
-      v-show="activeView === 'generate'"
-      id="generator-panel"
-      class="card"
-      role="region"
-      aria-labelledby="generator-nav-button"
-      :aria-busy="status === 'loading'"
-    >
-      <!-- 图片上传 -->
-      <div class="section">
-        <h2 class="label">1. 上传图片</h2>
-        <el-upload
-          v-if="!imagePreviewUrl"
-          ref="uploadRef"
-          class="upload"
-          drag
-          action="#"
-          :auto-upload="false"
-          accept=".jpg,.jpeg,.png,.webp,.heic,.heif"
-          :on-change="handleImageChange"
-          :limit="1"
-          :show-file-list="false"
-          aria-describedby="upload-help"
-        >
-          <el-icon class="el-icon--upload"><upload-filled /></el-icon>
-          <div class="el-upload__text">
-            拖拽图片到这里，或 <em>点击上传</em>
-          </div>
-          <template #tip>
-            <div id="upload-help" class="el-upload__tip">
-              仅支持 JPG / JPEG / PNG / WebP / HEIC / HEIF，最大 10MB
-            </div>
-          </template>
-        </el-upload>
-
-        <!-- 图片预览 + 删除按钮 -->
-        <div v-if="imagePreviewUrl" class="preview">
-          <div
-            v-if="imageIsHeif"
-            class="heif-preview"
-            role="img"
-            aria-label="HEIC 或 HEIF 图片已选择"
-          >
-            <strong>{{ imageFile?.name }}</strong>
-            <span>浏览器不直接预览此格式，将由后端安全转换为 JPEG</span>
-          </div>
-          <img v-else :src="imagePreviewUrl" alt="已选择的商品图片预览" />
-          <el-button
-            class="delete-btn"
-            type="danger"
-            :icon="Delete"
-            size="small"
-            @click="clearImage"
-          >
-            重新上传
-          </el-button>
-        </div>
-
-        <p class="privacy-note">
-          点击生成后，图片会经本地后端发送至已配置的第三方视觉模型服务。
-          请勿上传敏感或无授权图片；AI 输出可能有误，发布前请再次核对。
-        </p>
-      </div>
-
-      <!-- 可选参数 -->
-      <div class="section">
-        <h2 class="label">2. 填写可选信息（不填也行）</h2>
-        <div class="form-row">
-          <div class="form-field">
-            <label for="product-name">产品名</label>
-            <el-input
-              id="product-name"
-              v-model="form.productName"
-              placeholder="例如：柠檬气泡水"
-            />
-          </div>
-          <div class="form-field">
-            <label for="target-audience">目标人群</label>
-            <el-input
-              id="target-audience"
-              v-model="form.targetAudience"
-              placeholder="例如：年轻女生"
-            />
-          </div>
-          <div class="form-field">
-            <label for="tone">语气</label>
-            <el-input id="tone" v-model="form.tone" placeholder="例如：轻松种草" />
-          </div>
-        </div>
-      </div>
-
-      <!-- 生成按钮 -->
-      <div class="section">
-        <el-button
-          type="primary"
-          size="large"
-          :loading="status === 'loading'"
-          :disabled="!imageFile"
-          @click="handleGenerate"
-        >
-          {{ status === 'loading' ? '生成中...' : '生成文案' }}
-        </el-button>
-      </div>
-
-      <!-- 错误提示 -->
-      <el-alert
-        v-if="status === 'error'"
-        :title="errorMessage || '生成失败，请重试'"
-        type="error"
-        show-icon
-        class="alert"
-        role="alert"
-      />
-
-      <!-- 成功时允许再次生成；失败时仅对可重试错误显示快捷重试按钮。 -->
-      <div
-        v-if="status === 'success' || (status === 'error' && errorRetryable)"
-        class="section"
-      >
-        <el-button
-          type="default"
-          size="large"
-          :icon="RefreshRight"
-          @click="handleGenerate"
-        >
-          重新生成
-        </el-button>
-      </div>
-
-      <!-- 结果展示 -->
-      <div v-if="status === 'success'" class="result" aria-live="polite">
-        <div class="result-header">
-          <h2>生成结果</h2>
-          <el-button type="success" :icon="DocumentCopy" @click="copyAll">
-            复制全部文案
-          </el-button>
-        </div>
-
-        <details class="image-summary-details">
-          <summary>图片理解摘要</summary>
-          <p>{{ result.image_summary }}</p>
-        </details>
-
-        <div class="result-block">
-          <h3>标题</h3>
-          <p class="title-text">{{ result.title }}</p>
-        </div>
-
-        <div class="result-block">
-          <h3>正文</h3>
-          <p class="body-text">{{ result.body }}</p>
-        </div>
-
-        <div class="result-block">
-          <h3>标签</h3>
-          <div class="tags">
-            <el-tag v-for="tag in result.tags" :key="tag" type="primary">{{ tag }}</el-tag>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section
-      v-show="activeView === 'history'"
-      id="history-panel"
-      class="card history-panel"
-      role="region"
-      aria-labelledby="history-nav-button"
-      :aria-busy="historyStatus === 'loading'"
-    >
-      <div class="history-header">
-        <div>
-          <h2>历史记录</h2>
-          <p>仅显示最近 {{ HISTORY_LIMIT }} 条成功记录，本功能限本地单用户使用。</p>
-        </div>
-        <el-button
-          :icon="RefreshRight"
-          :loading="historyStatus === 'loading'"
-          :disabled="historyStatus === 'loading'"
-          @click="loadHistory"
-        >
-          刷新
-        </el-button>
-      </div>
-
-      <div
-        v-if="historyStatus === 'loading'"
-        class="history-state"
-        role="status"
-        aria-live="polite"
-      >
-        <p>正在读取历史记录...</p>
-        <el-skeleton :rows="4" animated />
-      </div>
-
-      <div
-        v-else-if="historyStatus === 'error'"
-        class="history-state"
-      >
-        <el-alert
-          title="历史记录读取失败"
-          :description="historyError"
-          type="error"
-          show-icon
-          :closable="false"
-        />
-        <el-button type="primary" :icon="RefreshRight" @click="loadHistory">
-          重新加载
-        </el-button>
-      </div>
-
-      <el-empty
-        v-else-if="historyStatus === 'success' && historyItems.length === 0"
-        description="暂无历史记录"
-      >
-        <p class="empty-hint">
-          MySQL 未启用时历史记录为空；完成一次生成后可在这里查看结果。
-        </p>
-      </el-empty>
-
-      <div
-        v-else-if="historyStatus === 'success'"
-        class="history-results"
-        aria-live="polite"
-      >
-        <p class="history-count">本次读取 {{ historyCount }} 条成功记录</p>
-        <article
-          v-for="item in historyItems"
-          :key="item.generation_id"
-          class="history-item"
-        >
-          <div class="history-item-header">
-            <div>
-              <h3>{{ item.title }}</h3>
-              <time :datetime="item.created_at">{{ formatCreatedAt(item.created_at) }}</time>
-            </div>
-            <el-button
-              type="success"
-              plain
-              :icon="DocumentCopy"
-              :aria-label="`复制历史文案：${item.title}`"
-              @click="copyGeneration(item)"
-            >
-              复制文案
-            </el-button>
-          </div>
-
-          <details class="image-summary-details">
-            <summary :aria-label="`图片理解摘要：${item.title}`">图片理解摘要</summary>
-            <p>{{ item.image_summary }}</p>
-          </details>
-          <p class="history-body">{{ item.body }}</p>
-          <div class="tags" aria-label="历史记录标签">
-            <el-tag v-for="tag in item.tags" :key="tag" type="primary">
-              {{ tag }}
-            </el-tag>
-          </div>
-        </article>
-      </div>
-    </section>
+    <main id="main-content" class="site-main">
+      <RouterView />
     </main>
+
+    <footer class="site-footer">
+      <span>本地演示工具</span>
+      <span aria-hidden="true">·</span>
+      <span>AI 输出请人工核对</span>
+      <span aria-hidden="true">·</span>
+      <span>不含自动发布</span>
+    </footer>
+
+    <AuthDialog
+      :open="authDialogOpen"
+      :mode="authMode"
+      :busy="authBusy || authStatus === 'restoring'"
+      :service-unavailable="authStatus === 'unavailable'"
+      :error-message="authError"
+      @close="closeAuthDialog"
+      @retry-session="retryAccountSession"
+      @switch-mode="switchAuthMode"
+      @submit="handleAuthSubmit"
+    />
   </div>
 </template>
-
 <style scoped>
-.app {
-  max-width: 1120px;
+.app-shell {
+  width: min(100%, 1240px);
+  min-height: 100vh;
   margin: 0 auto;
-  padding: 40px 20px;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  padding: 24px 24px 18px;
+}
+
+.skip-link {
+  position: fixed;
+  z-index: 3000;
+  top: 12px;
+  left: 12px;
+  padding: 11px 16px;
+  border-radius: 10px;
+  color: #fff;
+  background: #801027;
+  font-weight: 700;
+  text-decoration: none;
+  transform: translateY(-180%);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
 }
 
 .site-header {
+  position: sticky;
+  z-index: 100;
+  top: 12px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 24px;
-  margin-bottom: 24px;
+  gap: 22px;
+  min-height: 68px;
+  margin-bottom: 32px;
+  padding: 10px 12px 10px 16px;
+  border: 1px solid rgba(234, 224, 228, 0.88);
+  border-radius: 20px;
+  background: rgba(255, 253, 254, 0.9);
+  box-shadow: 0 14px 42px rgba(53, 28, 37, 0.08);
+  backdrop-filter: blur(16px);
 }
 
 .brand {
@@ -712,416 +874,250 @@ function copyAll() {
   align-items: center;
   gap: 10px;
   min-height: 44px;
-  padding: 0;
-  border: 0;
   color: #211b23;
-  background: transparent;
-  font: inherit;
-  cursor: pointer;
+  text-decoration: none;
 }
 
-.brand span {
+.brand-mark {
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
   place-items: center;
-  border-radius: 11px;
+  border-radius: 12px;
   color: #fff;
-  background: #c1122f;
-  font-size: 15px;
-  font-weight: 800;
+  background: linear-gradient(145deg, #c1122f, #921126);
   box-shadow: 0 8px 18px rgba(193, 18, 47, 0.22);
+}
+
+.brand-mark svg {
+  width: 19px;
+  height: 19px;
 }
 
 .brand strong {
   font-size: 16px;
+  white-space: nowrap;
 }
 
-.brand:focus-visible {
-  outline: 3px solid rgba(193, 18, 47, 0.3);
-  outline-offset: 4px;
-  border-radius: 8px;
+.brand:focus-visible,
+.route-nav a:focus-visible,
+.account-link:focus-visible {
+  outline: 3px solid rgba(167, 15, 42, 0.3);
+  outline-offset: 3px;
+}
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  min-width: 0;
+}
+
+.route-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 13px;
+  background: #f6f1f3;
+}
+
+.route-nav a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  color: #625963;
+  font-size: 14px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.route-nav a:hover {
+  color: #8f1027;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.route-nav a.router-link-exact-active {
+  color: #fff;
+  background: #9d1028;
+  box-shadow: 0 7px 16px rgba(157, 16, 40, 0.18);
+}
+
+.account-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-height: 44px;
+}
+
+.account-mode-badge,
+.account-status {
+  padding: 7px 10px;
+  border-radius: 999px;
+  color: #665e68;
+  background: #f3eef0;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.account-status--warning {
+  color: #875316;
+  background: #fff4dc;
+}
+
+.account-identity {
+  display: grid;
+  max-width: 220px;
+  text-align: right;
+}
+
+.account-identity strong,
+.account-identity small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-identity strong {
+  color: #302832;
+  font-size: 13px;
+}
+
+.account-identity small {
+  color: #746c76;
+  font-size: 11px;
+}
+
+.account-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  padding: 8px 13px;
+  border: 1px solid #ded4d8;
+  border-radius: 10px;
+  color: #514851;
+  background: #fff;
+  font-size: 14px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.account-link--primary {
+  border-color: #9d1028;
+  color: #fff;
+  background: #9d1028;
 }
 
 .site-main {
-  display: block;
+  min-height: calc(100vh - 190px);
 }
 
-.workspace-heading {
-  margin: 38px auto 28px;
-  text-align: center;
-}
-
-.title {
-  text-align: center;
-  font-size: 28px;
-  margin: 0 0 8px;
-  color: #1f2937;
-}
-
-.subtitle {
-  text-align: center;
-  color: #6b7280;
-  margin: 0 0 32px;
-}
-
-.view-switch {
+.site-footer {
   display: flex;
   justify-content: center;
-  gap: 12px;
-}
-
-.view-switch .el-button + .el-button {
-  margin-left: 0;
-}
-
-.view-switch :deep(.el-button) {
-  min-height: 44px;
-  padding-inline: 18px;
-}
-
-.view-switch :deep(.el-button--primary) {
-  border-color: #b10f2a;
-  background: #b10f2a;
-}
-
-.view-switch :deep(.el-button:focus-visible) {
-  outline: 3px solid rgba(177, 15, 42, 0.3);
-  outline-offset: 2px;
-}
-
-.card {
-  box-sizing: border-box;
-  width: min(100%, 720px);
-  margin: 0 auto;
-  background: #fff;
-  border-radius: 12px;
-  padding: 28px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
-}
-
-.section {
-  margin-bottom: 28px;
-}
-
-.section:last-child {
-  margin-bottom: 0;
-}
-
-.label {
-  display: block;
-  font-weight: 600;
-  font-size: 16px;
-  line-height: 1.5;
-  margin-top: 0;
-  margin-bottom: 12px;
-  color: #374151;
-}
-
-.upload :deep(.el-upload__text em) {
-  color: #a70f2a;
-  font-weight: 700;
-}
-
-.privacy-note {
-  margin: 16px 0 0;
-  padding: 12px 14px;
-  border-left: 3px solid #c1122f;
-  border-radius: 6px;
-  color: #5f5661;
-  background: #fff5f6;
-  font-size: 13px;
-  line-height: 1.65;
-}
-
-.form-row {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.form-field {
-  display: grid;
-  gap: 7px;
-  text-align: left;
-}
-
-.form-field label {
-  color: #4b4450;
-  font-size: 14px;
-  font-weight: 650;
-}
-
-.form-field :deep(.el-input__wrapper) {
-  min-height: 44px;
-}
-
-.form-field :deep(.el-input__inner) {
-  font-size: 16px;
-}
-
-.preview {
-  margin-top: 16px;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 12px;
-}
-
-.preview img {
-  max-width: 100%;
-  max-height: 300px;
-  border-radius: 8px;
-  border: 1px solid #e5e7eb;
-}
-
-.heif-preview {
-  box-sizing: border-box;
-  width: min(100%, 480px);
-  min-height: 160px;
-  padding: 24px;
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  background: #f8fafc;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 8px;
-  color: #334155;
-}
-
-.heif-preview strong {
-  overflow-wrap: anywhere;
-}
-
-.heif-preview span {
-  color: #64748b;
-  font-size: 14px;
-}
-
-.delete-btn {
-  margin-top: 8px;
-}
-
-.alert {
-  margin-bottom: 20px;
-}
-
-.result {
-  margin-top: 24px;
-  padding-top: 24px;
-  border-top: 1px solid #e5e7eb;
-}
-
-.result-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 20px;
-}
-
-.result-header h2 {
-  margin: 0;
-  font-size: 20px;
-}
-
-.result-block {
-  margin-bottom: 20px;
-}
-
-.result-block h3 {
-  font-size: 14px;
-  color: #6b7280;
-  margin-bottom: 8px;
-}
-
-.result-block p {
-  margin: 0;
-  color: #1f2937;
-  line-height: 1.6;
-}
-
-.image-summary-details {
-  box-sizing: border-box;
-  width: 100%;
-  margin: 0 0 20px;
-  overflow: hidden;
-  border: 1px solid #e5e7eb;
-  border-radius: 10px;
-  background: #f8fafc;
-}
-
-.image-summary-details summary {
-  box-sizing: border-box;
-  min-height: 44px;
-  padding: 11px 14px;
-  color: #3f3742;
-  font-weight: 650;
-  line-height: 1.5;
-  overflow-wrap: anywhere;
-  cursor: pointer;
-}
-
-.image-summary-details summary::marker {
-  color: #b10f2a;
-}
-
-.image-summary-details summary:focus-visible {
-  outline: 3px solid rgba(177, 15, 42, 0.32);
-  outline-offset: -3px;
-}
-
-.image-summary-details[open] summary {
-  border-bottom: 1px solid #e5e7eb;
-}
-
-.image-summary-details p {
-  margin: 0;
-  padding: 14px;
-  color: #1f2937;
-  line-height: 1.65;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.title-text {
-  font-size: 18px;
-  font-weight: 600;
-  color: #b10f2a;
-}
-
-.body-text {
-  white-space: pre-line;
-}
-
-.tags {
-  display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  margin-top: 72px;
+  padding: 24px 12px 8px;
+  color: #837a83;
+  font-size: 12px;
 }
 
-.history-panel {
-  text-align: left;
+@media (prefers-reduced-motion: no-preference) {
+  .skip-link,
+  .route-nav a,
+  .account-link {
+    transition:
+      color 160ms ease,
+      background 160ms ease,
+      transform 160ms ease,
+      box-shadow 160ms ease;
+  }
 }
 
-.history-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 20px;
-  padding-bottom: 20px;
-  border-bottom: 1px solid #e5e7eb;
-}
+@media (max-width: 920px) {
+  .site-header {
+    position: static;
+    align-items: stretch;
+    flex-direction: column;
+  }
 
-.history-header h2 {
-  margin: 0 0 8px;
-  color: #1f2937;
-  font-size: 20px;
-}
+  .header-controls {
+    align-items: stretch;
+    justify-content: space-between;
+  }
 
-.history-header p,
-.history-count,
-.empty-hint {
-  margin: 0;
-  color: #6b7280;
-  font-size: 14px;
-  line-height: 1.6;
-}
+  .route-nav {
+    flex: 1 1 auto;
+  }
 
-.history-state {
-  display: grid;
-  gap: 20px;
-  margin-top: 24px;
-}
+  .route-nav a {
+    flex: 1 1 0;
+  }
 
-.history-state > p {
-  margin: 0;
-  color: #6b7280;
-}
-
-.history-results {
-  display: grid;
-  gap: 16px;
-  margin-top: 20px;
-}
-
-.history-item {
-  padding: 20px;
-  border: 1px solid #e5e7eb;
-  border-radius: 10px;
-  background: #fdfdfd;
-  overflow-wrap: anywhere;
-}
-
-.history-item-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 16px;
-}
-
-.history-item-header h3 {
-  margin: 0 0 6px;
-  color: #ff2442;
-  font-size: 18px;
-}
-
-.history-item-header time {
-  color: #6b7280;
-  font-size: 13px;
-}
-
-.history-body {
-  margin: 0 0 16px;
-  color: #1f2937;
-  line-height: 1.65;
-}
-
-.history-body {
-  white-space: pre-wrap;
+  .account-actions {
+    flex-wrap: wrap;
+  }
 }
 
 @media (max-width: 640px) {
-  .app {
-    padding: 24px 12px;
-  }
-
-  .card {
-    padding: 20px 16px;
+  .app-shell {
+    padding: 12px 12px 16px;
   }
 
   .site-header {
-    align-items: stretch;
-    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 20px;
+    padding: 10px;
+    border-radius: 16px;
   }
 
   .brand {
     align-self: center;
   }
 
-  .view-switch,
-  .history-header,
-  .history-item-header {
-    flex-wrap: wrap;
+  .header-controls {
+    flex-direction: column;
   }
 
-  .view-switch .el-button {
-    flex: 1 1 140px;
-  }
-
-  .history-header,
-  .history-item-header {
-    align-items: stretch;
-  }
-
-  .history-header > .el-button,
-  .history-item-header > .el-button {
+  .route-nav {
     width: 100%;
   }
 
-  .history-item {
-    padding: 16px;
+  .route-nav a {
+    min-width: 0;
+    padding-inline: 7px;
+    font-size: 13px;
+  }
+
+  .account-actions {
+    justify-content: center;
+  }
+
+  .account-identity {
+    max-width: min(100%, 230px);
+    text-align: left;
+  }
+
+  .site-footer {
+    margin-top: 48px;
+  }
+}
+
+@media (max-width: 380px) {
+  .route-nav {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .route-nav a {
+    min-height: 44px;
   }
 }
 </style>

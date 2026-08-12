@@ -43,6 +43,8 @@ SETTINGS_ENV_NAMES = (
     "DATABASE_POOL_TIMEOUT_SECONDS",
     "DATABASE_POOL_RECYCLE_SECONDS",
     "DATABASE_TLS_CA",
+    "AUTH_ENABLED",
+    "AUTH_COOKIE_SECURE",
 )
 SETTINGS_ENV_NAMES_CASEFOLDED = {name.casefold() for name in SETTINGS_ENV_NAMES}
 
@@ -59,6 +61,8 @@ def set_required_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_ENABLED", "false")
     monkeypatch.setenv("DATABASE_URL", "")
     monkeypatch.setenv("DATABASE_TLS_CA", "")
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    monkeypatch.setenv("AUTH_COOKIE_SECURE", "false")
 
 
 def test_loads_required_values_and_contract_defaults(
@@ -92,6 +96,10 @@ def test_loads_required_values_and_contract_defaults(
     assert settings.database_pool_timeout_seconds == 5
     assert settings.database_pool_recycle_seconds == 1800
     assert settings.database_tls_ca is None
+    assert settings.auth_enabled is False
+    assert settings.auth_cookie_secure is False
+    assert settings.auth_cookie_name == "xhs_session_local"
+    assert settings.auth_cookie_path == "/api/v1"
 
 
 @pytest.mark.parametrize(
@@ -176,6 +184,53 @@ def test_database_url_is_required_only_after_explicit_opt_in(
     assert str(error.value) == "database startup verification failed"
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
+
+
+def test_authentication_requires_explicit_database_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_required_environment(monkeypatch)
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+
+    with pytest.raises(ValidationError) as error:
+        Settings(_env_file=None)
+
+    assert "AUTH_ENABLED requires DATABASE_ENABLED" in str(error.value)
+    assert "test-secret-key" not in repr(error.value.errors())
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["https://frontend.example.com", "http://[::1]:5173"],
+)
+def test_local_authentication_accepts_only_supported_loopback_cors_origins(
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+) -> None:
+    set_required_environment(monkeypatch)
+    monkeypatch.setenv("DATABASE_ENABLED", "true")
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("CORS_ALLOW_ORIGINS", origin)
+
+    with pytest.raises(ValidationError) as error:
+        Settings(_env_file=None)
+
+    assert "authentication CORS origins are not authorized" in str(error.value)
+
+
+def test_secure_authentication_requires_https_and_uses_host_cookie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_required_environment(monkeypatch)
+    monkeypatch.setenv("DATABASE_ENABLED", "true")
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("AUTH_COOKIE_SECURE", "true")
+    monkeypatch.setenv("CORS_ALLOW_ORIGINS", "https://frontend.example.com")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.auth_cookie_name == "__Host-xhs_session"
+    assert settings.auth_cookie_path == "/"
 
 
 @pytest.mark.parametrize(

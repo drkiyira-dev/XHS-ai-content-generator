@@ -1,13 +1,16 @@
 # XHS AI Content Generator
 
-基于 Vue 3、FastAPI、PaddleOCR-VL 和 Qwen3-VL 的单图小红书文案生成全栈应用。页面接收一张图片和可选的商品名、目标人群、语气要求，并展示图片概述、标题、正文与标签。
+基于 Vue 3、FastAPI、PaddleOCR-VL 和 Qwen3-VL 的单图小红书内容生成全栈应用。页面接收一张图片和可选的主题或名称、目标读者、表达风格，并展示图片理解摘要、标题、正文与话题标签。
 
 ## 已实现功能
 
 - `POST /api/v1/generations`，使用 `multipart/form-data` 上传单张图片。
-- `GET /api/v1/generations`，读取最近成功生成的本地历史记录。
-- 首屏官网前台包含产品介绍、功能亮点、使用流程、FAQ 和工作台入口。
-- 前端可在生成工作台与历史记录页之间切换，支持历史加载、空状态、错误重试、刷新和单条复制。
+- `GET /api/v1/generations`，读取最近成功生成的本地历史记录与受限图片预览状态。
+- `GET /api/v1/generations/{generation_id}/image-preview`，按当前账号读取去元数据缩略图。
+- `DELETE /api/v1/generations/{generation_id}`，按当前账号软删除一条成功记录。
+- 工具首页包含功能介绍、使用流程、FAQ 和创作入口。
+- 前端使用独立 URL 提供工具首页、生成工作台与历史记录，支持直达、刷新、前进/后退，以及历史缩略图、载回工作台、复制和确认删除。
+- 可选的本地账号模式支持邮箱注册、登录、刷新恢复会话和退出；生成与历史按当前账号隔离。
 - 当前结果与历史卡片中的图片理解摘要默认收起，可使用原生折叠控件展开查看。
 - 支持 JPG、JPEG、PNG、WebP，以及单帧 HEIC/HEIF；HEIC/HEIF 会在服务端安全转换为 JPEG，
   并拒绝空文件、伪装格式、损坏图片、超限文件和异常尺寸。
@@ -96,6 +99,8 @@ SILICONFLOW_API_KEY=在此填写真实Key
 | `DATABASE_POOL_TIMEOUT_SECONDS` | 等待连接池的最长时间 | `5` |
 | `DATABASE_POOL_RECYCLE_SECONDS` | 连接回收周期 | `1800` |
 | `DATABASE_TLS_CA` | 远程 MySQL 的 CA 证书路径 | 空 |
+| `AUTH_ENABLED` | 是否显式挂载本地演示账号接口 | `false` |
+| `AUTH_COOKIE_SECURE` | 是否使用仅 HTTPS 可用的 Secure 会话 Cookie | `false` |
 
 安全要求：不得提交真实 `.env`、API Key、上传图片、日志或模型原始响应。项目的 `.gitignore` 已忽略这些内容。
 
@@ -108,9 +113,18 @@ SILICONFLOW_API_KEY=在此填写真实Key
 - 有限权限的非 `root` 用户；
 - 已执行 [migrations/001_generation_records.sql](migrations/001_generation_records.sql)
   的 `generation_records` 表；
+- 当前 owner-aware 持久层投入运行前，还需先备份旧历史，再依次显式执行
+  [migrations/003_auth_tables.sql](migrations/003_auth_tables.sql) 创建 `users` 与
+  `auth_sessions`，并执行
+  [migrations/004_generation_ownership.sql](migrations/004_generation_ownership.sql)
+  增加可空的 `generation_records.user_id`、外键和查询索引，随后执行
+  [migrations/005_generation_previews_and_deletion.sql](migrations/005_generation_previews_and_deletion.sql)
+  增加持久化受限预览与软删除字段；
+- 账号演示时必须同步开启后端 `AUTH_ENABLED` 与前端 `VITE_AUTH_ENABLED`；
 - 远程数据库还必须准备 CA 文件并配置 `DATABASE_TLS_CA`。
 
-迁移文件不会创建、选择或删除数据库，只会在操作者已经明确选中的数据库中创建项目表。
+迁移文件不会创建、选择或删除数据库，只会在操作者已经明确选中的数据库中创建或变更
+项目表结构。
 应用启动本身也不会自动建库、建表或修改 schema。
 
 准备完成后，在本地 `.env` 中填写，不要把密码发送到聊天或提交 Git：
@@ -127,6 +141,71 @@ DATABASE_URL=mysql+pymysql://xhs_app:在此填写密码@127.0.0.1:3306/xhs_ai_te
 本机专用测试库已经验证：API 成功写入、模型失败状态写入、重复 ID 回滚、同一 pending
 记录的并发终态竞争、Engine 释放后的重新连接与数据读取，以及本轮测试记录的精确清理。
 应用用户仅拥有该测试库的 `SELECT`、`INSERT`、`UPDATE`、`DELETE` 权限。
+
+## 账号接口（默认关闭）
+
+账号核心与以下接口已为后续本地演示准备好：
+
+- `POST /api/v1/auth/register`
+- `POST /api/v1/auth/login`
+- `GET /api/v1/auth/me`
+- `POST /api/v1/auth/logout`
+
+注册使用邮箱和密码，但演示版不发送激活邮件，也不会伪造已验证状态；响应中的
+`email_verified` 固定为 `false`。原始会话令牌只写入 `HttpOnly` Cookie，不进入 JSON、
+数据库或日志；数据库只保存 SHA-256 摘要。注册、登录和退出还要求固定
+`X-XHS-CSRF: 1` 请求头，并启用本地单进程限流。
+
+后端现已准备好账号归属边界：`AUTH_ENABLED=false` 时，生成与历史只访问明确的
+`user_id IS NULL` 兼容分区；`AUTH_ENABLED=true` 时，生成记录只能写入当前 Cookie 会话
+对应的账号，历史查询也只返回该账号的记录。请求不能通过表单、查询参数或请求头指定
+`user_id`，旧的 NULL 记录不会自动归给首个注册用户，也不会出现在任何账号的历史记录中。
+
+前端已经接入注册、登录、会话恢复与退出页面，但后端和前端模板仍默认关闭账号模式。
+只有完成受控备份并依次执行 003/004/005 后，才可同时设置后端 `AUTH_ENABLED=true` 与前端
+`VITE_AUTH_ENABLED=true`。任何尚未迁移的现有 MySQL 都不能直接运行 owner-aware 代码；
+启动探针会在缺少可空 `user_id`、预览或软删除字段时固定失败，避免到首个请求才暴露旧
+schema 错误。应用启动不会自动补表、迁移或修改旧数据。
+
+迁移已经完成并准备进行本地账号演示时，分别在两个未跟踪配置文件中同步开启：
+
+```dotenv
+# 仓库根目录 .env
+AUTH_ENABLED=true
+AUTH_COOKIE_SECURE=false
+
+# frontend/.env
+VITE_AUTH_ENABLED=true
+VITE_API_BASE_URL=http://127.0.0.1:8000
+```
+
+本地 HTTP 演示必须继续只监听 `127.0.0.1`。修改开关后需要重启后端与 Vite；不要把上述
+本地 Cookie 配置用于局域网或公网。
+
+### 迁移前备份旧历史
+
+仓库提供离线工具 `scripts/backup_generation_history.py`，只读备份账号归属迁移前的
+`generation_records` 原有 13 个字段。它不会备份账号表、数据库连接地址或图片文件，
+也不会执行 DDL、分配 `user_id` 或修改任何记录。备份写入被 Git 忽略的
+`.local-backups/`；每次结果是一个权限为 `0700` 的独立目录，其中数据与校验清单均为
+`0600`。工具写完后会重新读取、核对行数与 SHA-256，再以目录原子改名发布。
+
+执行前必须停止后端并保持数据库无写入；一致性快照无法覆盖快照开始后新增的记录。
+确认停写后，在项目根目录运行：
+
+```bash
+XHS_HISTORY_BACKUP_CONFIRM=YES_BACKUP_XHS_AI_HISTORY \
+  .venv/bin/python scripts/backup_generation_history.py
+```
+
+工具还会在终端要求逐项输入当前数据库名、快照记录数和 `BACKEND_STOPPED`；标准输入或
+输出不是交互式终端时会拒绝运行。它只允许固定的 `.local-backups/` 输出位置，不接受
+自定义路径，也不会覆盖已有备份。失败信息不会打印数据库 URL、凭据、SQL 参数或历史内容。
+备份成功只代表旧数据已有可校验副本，不代表数据已经属于任何账号。本项目采用“归档”
+策略：显式依次执行 003、004 与 005 后，旧记录继续保持 `user_id=NULL`，不会猜测归属、
+更新或删除；新增的预览与软删除字段也保持 `NULL`；
+账号模式下它们对所有用户均不可见。真实备份与迁移必须在停止后端的同一维护窗口内另行
+明确确认，本说明不会自行连接或改动当前 MySQL。
 
 ## 启动后端
 
@@ -157,7 +236,16 @@ npm --prefix frontend run dev -- --host 127.0.0.1
 ```
 
 浏览器访问 <http://127.0.0.1:5173>。前端通过 `VITE_API_BASE_URL` 调用后端；默认地址已与
-上面的 FastAPI 启动命令匹配。提交或交付前可运行生产构建检查：
+上面的 FastAPI 启动命令匹配。账号模式要求页面与 API 使用同一 hostname 体系，不要把
+`localhost` 与 `127.0.0.1` 混用，否则 SameSite Cookie 可能无法发送。提交或交付前可运行
+生产构建检查：
+
+- 工具首页：<http://127.0.0.1:5173/>
+- 生成工作台：<http://127.0.0.1:5173/app/generate>
+- 历史记录：<http://127.0.0.1:5173/app/history>
+
+Vite 开发服务器与 `vite preview` 可直接刷新这些地址。未来若使用其他静态服务器托管
+`frontend/dist/`，需要将页面路由回退到 `index.html`，但必须让 `/api/` 继续由后端处理。
 
 ```bash
 npm --prefix frontend run build
@@ -211,7 +299,8 @@ docker inspect --format '{{.State.Health.Status}}' xhs-ai-backend
 不要使用 Docker `ARG`、Dockerfile `ENV` 或镜像层传入真实 API Key；示例通过未跟踪的
 `.env.docker` 在运行时注入。镜像没有声明保存上传文件的 `VOLUME`，避免匿名卷残留图片。
 容器内部必须监听 `0.0.0.0` 才能接受端口映射，但宿主机只发布到 `127.0.0.1`，因为
-当前历史接口仍是无登录鉴权的本地单用户功能。
+默认 `AUTH_ENABLED=false` 时仍是 NULL-owner 本地兼容模式；账号模式只应在迁移完成且
+前后端开关同步开启后使用。
 
 `127.0.0.1` 在容器中指向容器自身，不是宿主机 MySQL。本段因此明确保持数据库关闭；
 如需同时启动后端与数据库，请使用下一节的 Compose 配置，不能用临时主机映射绕过
@@ -264,9 +353,15 @@ docker compose up --build --detach --wait
   临时图片只写入后端 tmpfs。
 
 首次使用空的 `mysql_data` 卷时，MySQL 官方入口只创建 `xhs_ai`，随后按顺序执行
-`001_generation_records.sql` 与 `002_create_app_user.sh`。第二个脚本直接创建 `xhs_app`，
+`001_generation_records.sql`、`002_create_app_user.sh`、
+`003_auth_tables.sql`、`004_generation_ownership.sql` 与
+`005_generation_previews_and_deletion.sql`。第二个脚本直接创建 `xhs_app`，
 第一次授权就只有运行时实际需要的 `SELECT`、`INSERT`、`UPDATE`；不存在先授予 `ALL` 再撤销的
-中断窗口。FastAPI 自身仍然只做启动检查，不执行 DDL。
+中断窗口。第三个迁移准备 `users` 与 `auth_sessions`，不会伪造邮箱激活状态；第四个迁移
+为生成记录增加可空的账号外键和历史查询索引，不回填、删除或猜测旧记录归属。FastAPI
+自身仍然只做启动检查，不执行 DDL。第五个迁移把去元数据、受限体积的历史预览保存在
+MySQL 中，并增加可空软删除时间；旧记录的这些字段保持 `NULL`。现有数据卷必须先显式
+执行 005，才能重启使用新版 ORM，Compose 不会自动补跑迁移。
 
 这些初始化脚本**只会在空数据卷上执行一次**。现有卷不会自动重放迁移；后续 schema
 变更必须使用单独、明确审批的迁移流程。若首次初始化中断或失败，应查看固定错误日志并
@@ -294,9 +389,9 @@ docker compose down --volumes
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `image` | 是 | 单张 JPG、JPEG、PNG、WebP 或单帧 HEIC/HEIF 图片，模板限制为 10MB；HEIC/HEIF 会转换为 JPEG 后送入模型 |
-| `product_name` | 否 | 用户猜测的候选商品名；与图片冲突时以图片为准 |
-| `target_audience` | 否 | 调整表达角度，不能作为产品适用性的事实证据 |
-| `tone` | 否 | 调整文案风格，不能作为产品属性的事实证据 |
+| `product_name` | 否 | 主题或名称提示；仅用于调整生成方向，与图片冲突时以图片为准 |
+| `target_audience` | 否 | 目标读者提示；不能作为适用人群的事实证据 |
+| `tone` | 否 | 表达风格提示；不能作为图片事实或产品属性的证据 |
 
 curl 示例：
 
@@ -328,11 +423,12 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/generations' \
 
 `generation_id` 和 `created_at` 每次请求都会变化。
 
-## 历史记录接口（本地单用户增值功能）
+## 历史记录接口（兼容模式与账号隔离）
 
 前端顶部的“历史记录”入口会在用户主动进入时读取最近成功结果，不会触发图片上传、
-OCR 或 Qwen 调用。页面展示图片摘要、标题、正文、标签和本地格式化时间，并允许复制
-单条文案；不会展示本地图片路径、用户输入、失败原因或数据库内部字段。
+OCR 或 Qwen 调用。页面展示受限缩略图、图片理解摘要、标题、正文、话题标签和本地格式化
+时间，并允许载回工作台、复制或删除单条记录；不会展示本地图片路径、用户输入、失败原因
+或数据库内部字段。
 
 ```http
 GET /api/v1/generations?limit=20
@@ -341,10 +437,13 @@ GET /api/v1/generations?limit=20
 - 只返回 `success` 记录，按创建时间从新到旧排列。
 - `limit` 默认为 `20`，允许范围为 `1` 到 `50`。
 - 响应沿用生成结果的 `generation_id`、`image_summary`、`title`、`body`、
-  `tags`、`created_at` 字段，并额外返回 `count`。
+  `tags`、`created_at` 字段，每项增加 `has_image_preview` 与受控的
+  `image_preview_url`，顶层额外返回 `count`。
 - 不返回本地图片路径、用户输入、失败原因或数据库内部字段。
 - 响应带有 `Cache-Control: no-store`，避免浏览器或代理缓存生成文案。
 - `DATABASE_ENABLED=false` 时 No-op 持久化不会保存数据，因此历史固定为空。
+- `AUTH_ENABLED=false` 时只读取 `user_id IS NULL` 的本地兼容分区，不会混入账号记录。
+- `AUTH_ENABLED=true` 时必须先登录，且只读取当前会话账号的记录；旧 NULL 归档记录不可见。
 
 示例：
 
@@ -357,16 +456,23 @@ GET /api/v1/generations?limit=20
       "title": "玫瑰果卸妆油开箱",
       "body": "包装上可见 CLEANSING OIL、ROSE HIP 和 100 ML。",
       "tags": ["#卸妆油", "#玫瑰果", "#护肤分享"],
-      "created_at": "2026-08-07T07:39:32.921950Z"
+      "created_at": "2026-08-07T07:39:32.921950Z",
+      "has_image_preview": true,
+      "image_preview_url": "/api/v1/generations/550e8400-e29b-41d4-a716-446655440000/image-preview"
     }
   ],
   "count": 1
 }
 ```
 
-该接口当前只面向 README 默认的 `127.0.0.1` 本地单用户演示。它没有登录鉴权或
-用户数据隔离，不得直接绑定 `0.0.0.0` 暴露到局域网或公网；若后续需要多用户部署，
-必须先增加身份认证和记录所有权过滤。
+新生成记录会保存最长边 480px、去元数据且不超过 256KiB 的 WebP 预览。预览读取与软删除
+始终按当前 owner 分区过滤；软删除会清除该记录的文案和预览内容，重复删除保持幂等。
+旧记录没有预览时仍可载回并查看文案，只显示“暂无图片预览”占位。
+
+模板与本地 `.env` 仍默认使用 `AUTH_ENABLED=false` 的 NULL-owner 兼容模式；账号演示时
+必须在完成受控数据库迁移后，再同步开启后端 `AUTH_ENABLED` 与前端
+`VITE_AUTH_ENABLED`。即使账号读写隔离与前端会话闭环均已具备，本项目的 Cookie、内存
+限流与运维边界仍只为本地测试和演示设计，不得直接绑定 `0.0.0.0` 暴露到局域网或公网。
 
 ## 错误响应
 
@@ -455,7 +561,7 @@ XHS_MYSQL_LIVE_TEST_CONFIRM=YES_USE_XHS_AI_TEST \
 CI 包含四个互相独立的任务：
 
 - Python 3.12：安装后端开发依赖并运行全部 `pytest`。
-- Node.js 24：使用 `npm ci` 按锁文件安装前端依赖并执行生产构建。
+- Node.js 24：使用 `npm ci` 按锁文件安装前端依赖，并分别验证兼容模式与账号模式的生产构建。
 - Docker：构建后端镜像，以非 root、只读文件系统、无网络和无 Linux capabilities 的
   容器执行 `/api/health` 冒烟检查；只使用无效占位 Key，不连接模型或 MySQL。
 - Docker Compose：使用临时占位 Key、随机数据库密码、内部无外网 bridge 和全新命名卷，
@@ -475,6 +581,7 @@ CI 包含四个互相独立的任务：
 - 成员 B 的多模态生成、事实安全、历史查询及 HEIC/HEIF 后端转换已经接入。
 - 成员 C 的数据库职责已通过异步 SQLAlchemy 适配器进入同一生成生命周期。
 - 前端允许上传 HEIC/HEIF；浏览器无法原生预览时显示文件占位说明，后端只接受单帧文件并执行最终安全校验与 JPEG 转换。
-- 本地单用户历史记录页面已接通安全的只读历史 API。
+- 本地账号注册、登录、会话恢复与退出已接入前端；账号模式下生成和历史按用户隔离。
+- 工具首页、生成工作台与历史记录已拆成 Vue Router 页面；共享工作区只保留在当前页面内存，账号边界变化时会统一清空。
 
 后续增值功能仍通过独立功能分支和 Pull Request 进入 `main`；禁止直接推送 `main`。

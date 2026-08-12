@@ -123,6 +123,7 @@ def _assert_expected_record(
     ]
     assert len(matching) == 1
     record = matching[0]
+    assert record.user_id is None
     assert record.image_summary == EXPECTED_IMAGE_SUMMARY
     assert record.title == EXPECTED_TITLE
     assert record.body == EXPECTED_BODY
@@ -132,6 +133,7 @@ def _assert_expected_record(
 async def _run(mode: str, generation_id: str | None) -> str | None:
     settings = get_settings()
     assert settings.database_enabled is True
+    assert settings.auth_enabled is False
     runtime = create_sqlalchemy_persistence_runtime(settings)
     try:
         await runtime.startup()
@@ -148,12 +150,14 @@ async def _run(mode: str, generation_id: str | None) -> str | None:
             await persistence.create_pending(
                 PendingGeneration(
                     generation_id=generation_id,
+                    user_id=None,
                     created_at=datetime.now(UTC),
                 )
             )
             await persistence.mark_success(
                 SuccessfulGeneration(
                     generation_id=generation_id,
+                    user_id=None,
                     image_summary=EXPECTED_IMAGE_SUMMARY,
                     title=EXPECTED_TITLE,
                     body=EXPECTED_BODY,
@@ -165,7 +169,7 @@ async def _run(mode: str, generation_id: str | None) -> str | None:
             assert generation_id is not None
             assert str(UUID(generation_id)) == generation_id
 
-        records = await persistence.list_successful(limit=50)
+        records = await persistence.list_successful(user_id=None, limit=50)
         _assert_expected_record(records, generation_id)
         _assert_upload_directory_empty(settings)
         return generation_id if mode == "write" else None
