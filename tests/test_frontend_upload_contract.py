@@ -113,9 +113,16 @@ def test_frontend_documentation_describes_the_real_api_default() -> None:
     app_source = APP_VUE.read_text(encoding="utf-8")
     frontend_readme = (ROOT / "frontend" / "README.md").read_text(encoding="utf-8")
     root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    root_readme_zh = (ROOT / "README.zh.md").read_text(encoding="utf-8")
 
     assert "当前是 Mock" not in app_source
     assert "USE_MOCK = true" not in frontend_readme
     assert "VITE_USE_MOCK=true" in frontend_readme
     assert "当前版本只完成成员 B" not in root_readme
-    assert "当前 `main` 已通过 PR 完成 A、B、C 三部分的整合" in root_readme
+    assert "[简体中文](README.zh.md)" in root_readme
+    assert "[English](README.md)" in root_readme_zh
+    assert (
+        "The current `main` branch integrates work from Members A, B, and C "
+        "through pull requests"
+    ) in root_readme
+    assert "当前 `main` 已通过 PR 完成 A、B、C 三部分的整合" in root_readme_zh
