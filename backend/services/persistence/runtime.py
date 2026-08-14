@@ -1,7 +1,7 @@
 """Application-owned SQLAlchemy runtime for explicit MySQL persistence."""
 
 from anyio import CancelScope, CapacityLimiter, Lock, to_thread
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import JSON, create_engine, inspect
 from sqlalchemy.engine import Engine, URL, make_url
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.orm import Session, sessionmaker
@@ -45,6 +45,7 @@ _GENERATION_REQUIRED_NULLABLE_COLUMNS = frozenset(
         "image_preview",
         "image_preview_media_type",
         "deleted_at",
+        "risk_assessment",
     }
 )
 
@@ -304,16 +305,20 @@ def _has_generation_owner_column(inspector: Inspector) -> bool:
 
 
 def _verify_generation_columns(inspector: Inspector) -> bool:
-    """Require deployed nullable ownership, preview, and soft-delete columns."""
+    """Require deployed nullable lifecycle columns and a JSON risk snapshot."""
     reflected = {
         column.get("name"): column
         for column in inspector.get_columns(GenerationRecord.__tablename__)
         if isinstance(column, dict)
     }
-    return all(
+    nullable_columns_are_valid = all(
         column_name in reflected
         and reflected[column_name].get("nullable") is True
         for column_name in _GENERATION_REQUIRED_NULLABLE_COLUMNS
+    )
+    return nullable_columns_are_valid and isinstance(
+        reflected["risk_assessment"].get("type"),
+        JSON,
     )
 
 

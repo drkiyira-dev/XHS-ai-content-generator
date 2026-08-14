@@ -21,10 +21,15 @@ from backend.services.persistence import (
     GenerationPersistence,
     NoOpGenerationPersistence,
 )
+from backend.schemas import RiskAssessmentSnapshot
 
 
 DEFAULT_TEST_USER_ID = 101
 DEFAULT_TEST_SESSION_TOKEN = "test-generation-session-token"
+TEST_RISK_SNAPSHOT = RiskAssessmentSnapshot(
+    rule_version="test-risk-v1",
+    findings=(),
+)
 
 
 class StubAuthenticationService:

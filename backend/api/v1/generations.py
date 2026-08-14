@@ -2,10 +2,11 @@
 
 import logging
 from datetime import UTC, datetime
-from typing import Annotated, cast
+from typing import Annotated, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Query, Request, Response
+from pydantic import ValidationError
 from starlette.datastructures import FormData, UploadFile
 from typing_extensions import TypedDict
 
@@ -28,7 +29,22 @@ from backend.services.image import (
     preprocess_validated_image,
     validate_uploaded_image,
 )
-from backend.services.model import GenerationModelService
+from backend.services.model import GeneratedCopy, GenerationModelService
+from backend.services.model.content_risk import (
+    CONTENT_RISK_RULE_VERSION,
+    ContentRiskFinding,
+    scan_content_risks,
+)
+from backend.services.model.enhancement import (
+    ContentCategory,
+    EmojiLevel,
+    enhance_generated_copy,
+    infer_content_category,
+)
+from backend.services.model.safety import (
+    find_strict_unsupported_claim_rule,
+    find_unsupported_claim_rule,
+)
 from backend.services.persistence import (
     FailedGeneration,
     GenerationPersistence,
@@ -37,6 +53,7 @@ from backend.services.persistence import (
     StoredImagePreview,
     SuccessfulGeneration,
 )
+from backend.schemas import RiskAssessmentSnapshot, RiskFindingSnapshot
 
 
 router = APIRouter(prefix="/generations", tags=["generations"])
@@ -48,7 +65,14 @@ HISTORY_CACHE_HEADERS = {
     "Vary": "Cookie",
 }
 GENERATION_FORM_FIELDS = frozenset(
-    {"image", "product_name", "target_audience", "tone"}
+    {
+        "image",
+        "product_name",
+        "target_audience",
+        "tone",
+        "emoji_level",
+        "related_tags",
+    }
 )
 GENERATION_MULTIPART_OPENAPI = {
     "requestBody": {
@@ -71,6 +95,20 @@ GENERATION_MULTIPART_OPENAPI = {
                         "product_name": {"type": "string"},
                         "target_audience": {"type": "string"},
                         "tone": {"type": "string"},
+                        "emoji_level": {
+                            "type": "string",
+                            "enum": ["off", "light", "expressive"],
+                            "default": "off",
+                            "description": "Optional deterministic emoji style",
+                        },
+                        "related_tags": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Append bounded local related tags; this is not "
+                                "a live popularity ranking"
+                            ),
+                        },
                     },
                 }
             }
@@ -127,6 +165,24 @@ class GenerationResponse(TypedDict):
     body: str
     tags: list[str]
     created_at: datetime
+    risk_assessment: "RiskAssessmentResponse"
+
+
+class RiskFindingResponse(TypedDict):
+    """One bounded advisory hint; never a platform-review verdict."""
+
+    code: str
+    severity: Literal["low", "medium", "high"]
+    field: Literal["title", "body", "tags"]
+    reason: str
+    suggestion: str
+
+
+class RiskAssessmentResponse(TypedDict):
+    """Versioned pre-publication hints for human review."""
+
+    rule_version: str
+    findings: list[RiskFindingResponse]
 
 
 class GenerationHistoryItemResponse(GenerationResponse):
@@ -182,23 +238,45 @@ async def list_generations(
             retryable=True,
         ) from None
 
-    items: list[GenerationHistoryItemResponse] = [
-        {
-            "generation_id": record.generation_id,
-            "image_summary": record.image_summary,
-            "title": record.title,
-            "body": record.body,
-            "tags": list(record.tags),
-            "created_at": record.created_at,
-            "has_image_preview": record.has_image_preview,
-            "image_preview_url": (
-                _image_preview_url(record.generation_id)
-                if record.has_image_preview
-                else None
-            ),
-        }
-        for record in records
-    ]
+    items: list[GenerationHistoryItemResponse] = []
+    for record in records:
+        try:
+            stored_copy = GeneratedCopy(
+                image_summary=record.image_summary,
+                title=record.title,
+                body=record.body,
+                tags=record.tags,
+            )
+            stored_risk_assessment = _history_risk_assessment(
+                record.risk_assessment
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            logger.error(
+                "Generation persistence returned invalid history data "
+                "type=%s generation_id=%s",
+                type(error).__name__,
+                record.generation_id,
+            )
+            raise _history_database_error() from None
+        items.append(
+            {
+                "generation_id": record.generation_id,
+                "image_summary": stored_copy.image_summary,
+                "title": stored_copy.title,
+                "body": stored_copy.body,
+                "tags": list(stored_copy.tags),
+                "created_at": record.created_at,
+                "risk_assessment": _risk_assessment_response(
+                    stored_risk_assessment
+                ),
+                "has_image_preview": record.has_image_preview,
+                "image_preview_url": (
+                    _image_preview_url(record.generation_id)
+                    if record.has_image_preview
+                    else None
+                ),
+            }
+        )
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     response.headers["Vary"] = "Cookie"
@@ -349,10 +427,17 @@ async def create_generation(
     )
     async with request.form(
         max_files=4,
-        max_fields=4,
+        max_fields=6,
         max_part_size=FORM_TEXT_LIMIT_BYTES,
     ) as form:
-        image, product_name, target_audience, tone = _parse_generation_form(form)
+        (
+            image,
+            product_name,
+            target_audience,
+            tone,
+            emoji_level,
+            include_related_tags,
+        ) = _parse_generation_form(form)
         validated_image = await validate_uploaded_image(image, settings)
 
     user_id = _user_id(current_user)
@@ -379,12 +464,31 @@ async def create_generation(
             raise _database_error() from None
 
         try:
-            generated_copy = await model_service.generate(
-                processed_image,
-                product_name=product_name,
-                target_audience=target_audience,
-                tone=tone,
+            generated_copy = GeneratedCopy.model_validate(
+                await model_service.generate(
+                    processed_image,
+                    product_name=product_name,
+                    target_audience=target_audience,
+                    tone=tone,
+                )
             )
+        except ValidationError:
+            error = APIError(
+                code="MODEL_OUTPUT_INVALID",
+                message="模型返回的内容格式无效，请重试。",
+                status_code=502,
+                retryable=True,
+            )
+            await _mark_failed_best_effort(
+                generation_persistence,
+                FailedGeneration(
+                    generation_id=generation_id,
+                    user_id=user_id,
+                    error_code=error.code,
+                    failed_at=datetime.now(UTC),
+                ),
+            )
+            raise error from None
         except APIError as error:
             await _mark_failed_best_effort(
                 generation_persistence,
@@ -408,6 +512,13 @@ async def create_generation(
             )
             raise
 
+        generated_copy = _apply_optional_enhancement(
+            generated_copy,
+            emoji_level=emoji_level,
+            include_related_tags=include_related_tags,
+        )
+        risk_assessment = _risk_assessment(generated_copy)
+
         image_preview = None
         try:
             image_preview = await create_history_image_preview(processed_image)
@@ -427,6 +538,7 @@ async def create_generation(
                     title=generated_copy.title,
                     body=generated_copy.body,
                     tags=generated_copy.tags,
+                    risk_assessment=risk_assessment,
                     image_preview=(
                         image_preview.content if image_preview is not None else None
                     ),
@@ -452,6 +564,7 @@ async def create_generation(
             "body": generated_copy.body,
             "tags": list(generated_copy.tags),
             "created_at": created_at,
+            "risk_assessment": _risk_assessment_response(risk_assessment),
         }
     finally:
         try:
@@ -468,7 +581,14 @@ async def create_generation(
 
 def _parse_generation_form(
     form: FormData,
-) -> tuple[UploadFile, str | None, str | None, str | None]:
+) -> tuple[
+    UploadFile,
+    str | None,
+    str | None,
+    str | None,
+    EmojiLevel,
+    bool,
+]:
     """Accept only the documented multipart fields with no duplicates."""
     if any(name not in GENERATION_FORM_FIELDS for name, _value in form.multi_items()):
         raise _invalid_form_error()
@@ -503,7 +623,162 @@ def _parse_generation_form(
             raise _invalid_form_error()
         values.append(field_parts[0])
 
-    return image_parts[0], values[0], values[1], values[2]
+    emoji_level = _parse_emoji_level(form)
+    include_related_tags = _parse_related_tags(form)
+    return (
+        image_parts[0],
+        values[0],
+        values[1],
+        values[2],
+        emoji_level,
+        include_related_tags,
+    )
+
+
+def _parse_emoji_level(form: FormData) -> EmojiLevel:
+    parts = form.getlist("emoji_level")
+    if not parts:
+        return EmojiLevel.OFF
+    if len(parts) != 1 or not isinstance(parts[0], str):
+        raise _invalid_form_error()
+    try:
+        return EmojiLevel(parts[0])
+    except ValueError:
+        raise _invalid_form_error() from None
+
+
+def _parse_related_tags(form: FormData) -> bool:
+    parts = form.getlist("related_tags")
+    if not parts:
+        return False
+    if len(parts) != 1 or not isinstance(parts[0], str):
+        raise _invalid_form_error()
+    if parts[0] == "true":
+        return True
+    if parts[0] == "false":
+        return False
+    raise _invalid_form_error()
+
+
+def _apply_optional_enhancement(
+    copy: GeneratedCopy,
+    *,
+    emoji_level: EmojiLevel,
+    include_related_tags: bool,
+) -> GeneratedCopy:
+    """Apply deterministic decoration, then re-run the existing fact guard."""
+    if emoji_level is EmojiLevel.OFF and not include_related_tags:
+        return copy
+
+    try:
+        category: ContentCategory = infer_content_category(copy)
+        enhanced = enhance_generated_copy(
+            copy,
+            emoji_level=emoji_level,
+            category=category,
+            include_related_tags=include_related_tags,
+        )
+        enhanced = GeneratedCopy.model_validate(enhanced)
+        violation_rule = find_unsupported_claim_rule(enhanced, ocr_text=None)
+        if violation_rule is None:
+            violation_rule = find_strict_unsupported_claim_rule(
+                enhanced,
+                ocr_text=None,
+            )
+    except Exception as error:
+        logger.error(
+            "Optional copy enhancement failed type=%s; using validated model copy",
+            type(error).__name__,
+        )
+        return copy
+
+    if violation_rule is not None:
+        logger.warning(
+            "Optional copy enhancement rejected rule=%s; using validated model copy",
+            violation_rule,
+        )
+        return copy
+    return enhanced
+
+
+def _risk_assessment(copy: GeneratedCopy) -> RiskAssessmentSnapshot:
+    """Build the immutable generation-time snapshot without matched text."""
+    public_findings: list[RiskFindingSnapshot] = []
+    seen: set[tuple[str, str]] = set()
+    try:
+        findings = scan_content_risks(copy)
+        for finding in findings:
+            field = _public_risk_field(finding)
+            if field is None or (finding.code, field) in seen:
+                continue
+            seen.add((finding.code, field))
+            public_findings.append(
+                RiskFindingSnapshot(
+                    code=finding.code,
+                    severity=finding.severity,
+                    field=field,
+                    reason=finding.reason,
+                    suggestion=finding.suggestion,
+                )
+            )
+        return RiskAssessmentSnapshot(
+            rule_version=CONTENT_RISK_RULE_VERSION,
+            findings=tuple(public_findings),
+        )
+    except Exception as error:
+        logger.error(
+            "Content risk scan unavailable type=%s",
+            type(error).__name__,
+        )
+        return RiskAssessmentSnapshot(
+            rule_version=CONTENT_RISK_RULE_VERSION,
+            findings=(
+                RiskFindingSnapshot(
+                    code="risk_scan_unavailable",
+                    severity="high",
+                    field="body",
+                    reason="本地发布风险扫描暂时不可用，当前结果尚未完成该项检查。",
+                    suggestion="发布前请完整人工核对正文与话题标签，稍后可重新生成以再次检查。",
+                ),
+            ),
+        )
+
+
+def _history_risk_assessment(
+    snapshot: RiskAssessmentSnapshot | None,
+) -> RiskAssessmentSnapshot:
+    """Return a stored snapshot, or an explicit warning for legacy NULL rows."""
+    if snapshot is not None:
+        return RiskAssessmentSnapshot.model_validate(snapshot)
+    return RiskAssessmentSnapshot(
+        rule_version="legacy-no-risk-snapshot",
+        findings=(
+            RiskFindingSnapshot(
+                code="legacy_risk_snapshot_unavailable",
+                severity="high",
+                field="body",
+                reason="该历史记录生成时未保存发布风险快照，无法还原当时的检查结果。",
+                suggestion="请重新人工核对标题、正文与话题标签，不要将当前规则视为当时的审核结论。",
+            ),
+        ),
+    )
+
+
+def _risk_assessment_response(
+    snapshot: RiskAssessmentSnapshot,
+) -> RiskAssessmentResponse:
+    """Serialize the exact persisted snapshot into the public response shape."""
+    return cast(RiskAssessmentResponse, snapshot.model_dump(mode="json"))
+
+
+def _public_risk_field(
+    finding: ContentRiskFinding,
+) -> Literal["title", "body", "tags"] | None:
+    if finding.field in {"title", "body"}:
+        return cast(Literal["title", "body"], finding.field)
+    if finding.field == "tags" or finding.field.startswith("tags["):
+        return "tags"
+    return None
 
 
 def _invalid_form_error() -> APIError:

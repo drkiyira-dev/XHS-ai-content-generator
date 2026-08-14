@@ -61,12 +61,17 @@ def test_generation_endpoint_accepts_frozen_multipart_contract() -> None:
         "body",
         "tags",
         "created_at",
+        "risk_assessment",
     }
     assert str(UUID(payload["generation_id"])) == payload["generation_id"]
     assert datetime.fromisoformat(payload["created_at"]).tzinfo is not None
     assert payload["image_summary"].startswith("测试模型已识别 JPEG 图片")
     assert payload["title"] == "测试生成标题"
     assert payload["tags"] == ["#接口测试", "#模型测试", "#结构化输出"]
+    assert payload["risk_assessment"]["rule_version"].startswith(
+        "content-risk-hints-"
+    )
+    assert payload["risk_assessment"]["findings"] == []
 
 
 def test_openapi_marks_image_as_a_binary_multipart_file() -> None:
@@ -82,6 +87,13 @@ def test_openapi_marks_image_as_a_binary_multipart_file() -> None:
     assert "HEIC" in image_schema["description"]
     assert "HEIF" in image_schema["description"]
     assert "user_id" not in str(operation)
+    assert operation["requestBody"]["content"]["multipart/form-data"][
+        "schema"
+    ]["properties"]["emoji_level"]["enum"] == [
+        "off",
+        "light",
+        "expressive",
+    ]
     error_schema_reference = operation["responses"]["502"]["content"][
         "application/json"
     ]["schema"]["$ref"]

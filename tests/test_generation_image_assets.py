@@ -24,6 +24,7 @@ from backend.services.persistence import (
     SuccessfulGeneration,
 )
 from tests.support import (
+    TEST_RISK_SNAPSHOT,
     StubAuthenticationService,
     build_test_app,
     make_image_bytes,
@@ -127,6 +128,7 @@ class MemoryPreviewPersistence:
             body=record.body,
             tags=record.tags,
             created_at=pending.created_at,
+            risk_assessment=record.risk_assessment,
             has_image_preview=record.image_preview is not None,
         )
 
@@ -284,6 +286,7 @@ def test_preview_and_delete_are_owner_scoped_and_delete_requires_csrf() -> None:
         title="安全标题",
         body="安全正文",
         tags=("#安全", "#归属", "#隔离"),
+        risk_assessment=TEST_RISK_SNAPSHOT,
         image_preview=make_image_bytes("JPEG"),
         image_preview_media_type="image/jpeg",
     )

@@ -116,6 +116,7 @@ def test_compose_initialization_is_scoped_and_permission_reducing() -> None:
         "./migrations/003_auth_tables.sql",
         "./migrations/004_generation_ownership.sql",
         "./migrations/005_generation_previews_and_deletion.sql",
+        "./migrations/006_generation_risk_snapshot.sql",
     }
     assert all(volume["read_only"] is True for volume in bind_mounts.values())
     assert [
@@ -128,6 +129,7 @@ def test_compose_initialization_is_scoped_and_permission_reducing() -> None:
         "/docker-entrypoint-initdb.d/003_auth_tables.sql",
         "/docker-entrypoint-initdb.d/004_generation_ownership.sql",
         "/docker-entrypoint-initdb.d/005_generation_previews_and_deletion.sql",
+        "/docker-entrypoint-initdb.d/006_generation_risk_snapshot.sql",
     ]
 
     migration_path = PROJECT_ROOT / "migrations" / "002_create_app_user.sh"

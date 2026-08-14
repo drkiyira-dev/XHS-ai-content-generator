@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
+from backend.schemas import RiskAssessmentSnapshot
+
 
 @dataclass(frozen=True, slots=True)
 class PendingGeneration:
@@ -24,6 +26,7 @@ class SuccessfulGeneration:
     title: str
     body: str
     tags: tuple[str, ...]
+    risk_assessment: RiskAssessmentSnapshot
     image_preview: bytes | None = field(default=None, repr=False)
     image_preview_media_type: str | None = None
 
@@ -49,6 +52,7 @@ class StoredGeneration:
     body: str
     tags: tuple[str, ...]
     created_at: datetime
+    risk_assessment: RiskAssessmentSnapshot | None = None
     has_image_preview: bool = False
 
 

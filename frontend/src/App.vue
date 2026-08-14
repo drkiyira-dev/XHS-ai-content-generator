@@ -9,13 +9,13 @@ import {
   ref,
   watch
 } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElButton, ElMessage } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { Reading } from '@element-plus/icons-vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 
 import AuthDialog from './components/AuthDialog.vue'
-import { AUTH_ENABLED } from './services/api'
+import { AUTH_ENABLED, USE_MOCK } from './services/api'
 import {
   deleteGeneration,
   generate,
@@ -26,7 +26,14 @@ import {
 } from './services/generation'
 import { readSafeNext, type ProtectedRouteName } from './router'
 import { authSession, type AuthMode } from './state/auth'
-import { WORKSPACE_KEY, type HistoryStatus } from './state/workspace'
+import {
+  WORKSPACE_KEY,
+  type EditableGenerationDraft,
+  type HistoryStatus,
+  type SubmittedGenerationConfig,
+  type WorkspaceVersion,
+  type WorkspaceForm
+} from './state/workspace'
 
 // ===== 页面状态 =====
 // idle: 空闲
@@ -69,10 +76,12 @@ const historyDeleteTokens = new Map<string, number>()
 let historyRevision = 0
 
 // ===== 用户输入 =====
-const form = reactive({
+const form = reactive<WorkspaceForm>({
   productName: '',
   targetAudience: '',
-  tone: ''
+  tone: '',
+  emojiLevel: 'light',
+  relatedTags: true
 })
 
 // ===== 图片相关 =====
@@ -81,6 +90,8 @@ const imagePreviewUrl = ref('')
 const imageIsHeif = ref(false)
 const imageResetEpoch = ref(0)
 const restoredFromHistory = ref(false)
+const imageToken = ref(0)
+let generationVersionSequence = 0
 
 // 常量配置
 type SupportedImageFormat = 'JPEG' | 'PNG' | 'WEBP' | 'HEIF'
@@ -196,10 +207,12 @@ function detectImageFormat(file: File): Promise<SupportedImageFormat | null> {
 
 // 用户选择图片后触发
 async function handleImageChange(file: UploadFile) {
+  // 即使上传组件被脚本触发，也要作废上一张图片仍在途的生成结果。
+  generationRequestId += 1
   const selectionId = ++imageSelectionId
   // 重置状态
   restoredFromHistory.value = false
-  status.value = 'idle'
+  status.value = hasResult.value ? 'success' : 'idle'
   errorMessage.value = ''
   errorRetryable.value = false
 
@@ -247,6 +260,7 @@ async function handleImageChange(file: UploadFile) {
   }
 
   // 通过校验，保存图片
+  imageToken.value += 1
   imageFile.value = raw
   imageIsHeif.value = detectedFormat === 'HEIF'
   imagePreviewUrl.value = URL.createObjectURL(raw)
@@ -255,7 +269,10 @@ async function handleImageChange(file: UploadFile) {
 
 // 清空图片和结果
 function clearImage() {
+  // 清空或更换图片后，旧请求可以在后端完成，但不得回写当前工作台。
+  generationRequestId += 1
   imageSelectionId += 1
+  imageToken.value += 1
   // 通知当前生成页清空 el-upload 的内部队列，避免 limit=1 阻止再次选择。
   imageResetEpoch.value += 1
   imageFile.value = null
@@ -267,30 +284,141 @@ function clearImage() {
     }
     imagePreviewUrl.value = ''
   }
+  status.value = hasResult.value ? 'success' : 'idle'
+  errorMessage.value = ''
+  errorRetryable.value = false
+}
+
+// ===== 生成结果与本地编辑版本 =====
+const currentVersion = ref<WorkspaceVersion | null>(null)
+const previousVersion = ref<WorkspaceVersion | null>(null)
+const hasResult = computed(() => currentVersion.value !== null)
+const isGenerating = computed(() => status.value === 'loading')
+const isRegenerating = computed(() => isGenerating.value && hasResult.value)
+
+function cloneGenerationResponse(value: GenerationResponse): GenerationResponse {
+  return {
+    generation_id: value.generation_id,
+    image_summary: value.image_summary,
+    title: value.title,
+    body: value.body,
+    tags: [...value.tags],
+    created_at: value.created_at,
+    risk_assessment: {
+      rule_version: value.risk_assessment.rule_version,
+      findings: value.risk_assessment.findings.map(finding => ({
+        code: finding.code,
+        severity: finding.severity,
+        field: finding.field,
+        reason: finding.reason,
+        suggestion: finding.suggestion
+      }))
+    }
+  }
+}
+
+function cloneDraft(value: EditableGenerationDraft): EditableGenerationDraft {
+  return {
+    title: value.title,
+    body: value.body,
+    tags: [...value.tags]
+  }
+}
+
+function cloneWorkspaceVersion(value: WorkspaceVersion): WorkspaceVersion {
+  return {
+    key: value.key,
+    server: cloneGenerationResponse(value.server),
+    draft: cloneDraft(value.draft),
+    submitted: value.submitted === null ? null : { ...value.submitted },
+    source: value.source
+  }
+}
+
+function createWorkspaceVersion(
+  response: GenerationResponse,
+  submitted: SubmittedGenerationConfig | null,
+  source: WorkspaceVersion['source']
+): WorkspaceVersion {
+  const server = cloneGenerationResponse(response)
+  return {
+    key: ++generationVersionSequence,
+    server,
+    draft: {
+      title: server.title,
+      body: server.body,
+      tags: [...server.tags]
+    },
+    submitted: submitted === null ? null : { ...submitted },
+    source
+  }
+}
+
+function currentSubmittedConfig(): SubmittedGenerationConfig {
+  return {
+    imageToken: imageToken.value,
+    productName: form.productName.trim(),
+    targetAudience: form.targetAudience.trim(),
+    tone: form.tone.trim(),
+    emojiLevel: form.emojiLevel,
+    relatedTags: form.relatedTags
+  }
+}
+
+function sameSubmittedConfig(
+  left: SubmittedGenerationConfig,
+  right: SubmittedGenerationConfig
+): boolean {
+  return left.imageToken === right.imageToken &&
+    left.productName === right.productName &&
+    left.targetAudience === right.targetAudience &&
+    left.tone === right.tone &&
+    left.emojiLevel === right.emojiLevel &&
+    left.relatedTags === right.relatedTags
+}
+
+const configState = computed<'none' | 'clean' | 'dirty' | 'unknown'>(() => {
+  if (currentVersion.value === null) {
+    return 'none'
+  }
+  if (currentVersion.value.submitted === null) {
+    return 'unknown'
+  }
+  return sameSubmittedConfig(
+    currentVersion.value.submitted,
+    currentSubmittedConfig()
+  ) ? 'clean' : 'dirty'
+})
+
+const draftDirty = computed(() => {
+  const version = currentVersion.value
+  if (version === null) {
+    return false
+  }
+  return version.draft.title !== version.server.title ||
+    version.draft.body !== version.server.body ||
+    version.draft.tags.length !== version.server.tags.length ||
+    version.draft.tags.some((tag, index) => tag !== version.server.tags[index])
+})
+const riskSnapshotStale = computed(() => draftDirty.value)
+
+function clearGenerationResult() {
+  currentVersion.value = null
+  previousVersion.value = null
   status.value = 'idle'
   errorMessage.value = ''
   errorRetryable.value = false
 }
 
-// ===== 生成结果 =====
-const result = reactive<GenerationResponse>({
-  generation_id: '',
-  image_summary: '',
-  title: '',
-  body: '',
-  tags: [],
-  created_at: ''
-})
-
-function clearGenerationResult() {
-  Object.assign(result, {
-    generation_id: '',
-    image_summary: '',
-    title: '',
-    body: '',
-    tags: [],
-    created_at: ''
-  })
+function restoreGeneratedDraft() {
+  if (currentVersion.value === null) {
+    return
+  }
+  currentVersion.value.draft = {
+    title: currentVersion.value.server.title,
+    body: currentVersion.value.server.body,
+    tags: [...currentVersion.value.server.tags]
+  }
 }
 
 function resetAccountScopedState() {
@@ -304,6 +432,8 @@ function resetAccountScopedState() {
   form.productName = ''
   form.targetAudience = ''
   form.tone = ''
+  form.emojiLevel = 'light'
+  form.relatedTags = true
   historyItems.value = []
   historyCount.value = 0
   historyError.value = ''
@@ -409,13 +539,19 @@ async function handleGenerate() {
     return
   }
 
+  if (isGenerating.value) {
+    return
+  }
+
   // 1. 简单校验
   if (!imageFile.value) {
     ElMessage.warning('请先上传图片')
     return
   }
 
-  // 2. 进入 loading，禁用按钮
+  const submitted = currentSubmittedConfig()
+
+  // 2. 进入 loading。若已有版本，只标记“生成新版”，不移走旧稿。
   status.value = 'loading'
   errorMessage.value = ''
   errorRetryable.value = false
@@ -424,15 +560,17 @@ async function handleGenerate() {
   const formData = new FormData()
   formData.append('image', imageFile.value, imageFile.value.name)
 
-  if (form.productName.trim()) {
-    formData.append('product_name', form.productName.trim())
+  if (submitted.productName) {
+    formData.append('product_name', submitted.productName)
   }
-  if (form.targetAudience.trim()) {
-    formData.append('target_audience', form.targetAudience.trim())
+  if (submitted.targetAudience) {
+    formData.append('target_audience', submitted.targetAudience)
   }
-  if (form.tone.trim()) {
-    formData.append('tone', form.tone.trim())
+  if (submitted.tone) {
+    formData.append('tone', submitted.tone)
   }
+  formData.append('emoji_level', submitted.emojiLevel)
+  formData.append('related_tags', submitted.relatedTags ? 'true' : 'false')
 
   const requestId = ++generationRequestId
   const requestedAuthRevision = authRevision.value
@@ -448,7 +586,11 @@ async function handleGenerate() {
     ) {
       return
     }
-    Object.assign(result, data)
+    if (currentVersion.value !== null) {
+      previousVersion.value = cloneWorkspaceVersion(currentVersion.value)
+    }
+    currentVersion.value = createWorkspaceVersion(data, submitted, 'generated')
+    restoredFromHistory.value = false
     status.value = 'success'
     historyRevision += 1
     historyLoaded.value = false
@@ -467,7 +609,6 @@ async function handleGenerate() {
       handleSessionExpired('generate')
       return
     }
-    status.value = 'error'
     if (err instanceof GenerationError) {
       errorMessage.value = err.message
       errorRetryable.value = err.retryable
@@ -475,6 +616,7 @@ async function handleGenerate() {
       errorMessage.value = '生成失败，请重试。'
       errorRetryable.value = false
     }
+    status.value = currentVersion.value === null ? 'error' : 'success'
   }
 }
 
@@ -546,14 +688,27 @@ async function restoreHistoryItem(generation: GenerationHistoryItem): Promise<vo
   form.productName = ''
   form.targetAudience = ''
   form.tone = ''
-  Object.assign(result, {
+  form.emojiLevel = 'light'
+  form.relatedTags = true
+  currentVersion.value = createWorkspaceVersion({
     generation_id: generation.generation_id,
     image_summary: generation.image_summary,
     title: generation.title,
     body: generation.body,
     tags: [...generation.tags],
-    created_at: generation.created_at
-  })
+    created_at: generation.created_at,
+    risk_assessment: {
+      rule_version: generation.risk_assessment.rule_version,
+      findings: generation.risk_assessment.findings.map(finding => ({
+        code: finding.code,
+        severity: finding.severity,
+        field: finding.field,
+        reason: finding.reason,
+        suggestion: finding.suggestion
+      }))
+    }
+  }, null, 'history')
+  previousVersion.value = null
   imageFile.value = null
   imagePreviewUrl.value = generation.has_image_preview
     ? generation.image_preview_url ?? ''
@@ -661,8 +816,29 @@ async function copyGeneration(generation: GenerationResponse) {
   }
 }
 
+async function copyDraft(draft: EditableGenerationDraft) {
+  const text = `标题：${draft.title}\n\n正文：\n${draft.body}\n\n标签：${draft.tags.join(' ')}`
+  if (!navigator.clipboard?.writeText) {
+    ElMessage.error('复制失败，请手动复制')
+    return
+  }
+
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success('已复制当前编辑稿')
+  } catch {
+    ElMessage.error('复制失败，请手动复制')
+  }
+}
+
 function copyAll() {
-  void copyGeneration(result)
+  if (currentVersion.value !== null) {
+    void copyDraft(currentVersion.value.draft)
+  }
+}
+
+function copyVersion(version: WorkspaceVersion) {
+  void copyDraft(version.draft)
 }
 
 provide(WORKSPACE_KEY, {
@@ -675,11 +851,20 @@ provide(WORKSPACE_KEY, {
   imageIsHeif,
   imageResetEpoch,
   restoredFromHistory,
-  result,
+  currentVersion,
+  previousVersion,
+  hasResult,
+  isGenerating,
+  isRegenerating,
+  configState,
+  draftDirty,
+  riskSnapshotStale,
   handleImageChange,
   clearImage,
   handleGenerate,
   copyAll,
+  copyVersion,
+  restoreGeneratedDraft,
   historyStatus,
   historyItems,
   historyCount,
@@ -742,7 +927,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-shell">
+  <div
+    class="app-shell"
+    :class="{ 'app-shell--workspace': route.name === 'generate' }"
+  >
     <a class="skip-link" href="#page-title">跳到主要内容</a>
 
     <header class="site-header">
@@ -764,7 +952,7 @@ onBeforeUnmount(() => {
             class="account-mode-badge"
             role="status"
           >
-            免登录演示
+            {{ USE_MOCK ? 'Mock 演示' : '免登录演示' }}
           </span>
           <span
             v-else-if="authStatus === 'restoring'"
@@ -831,6 +1019,14 @@ onBeforeUnmount(() => {
   min-height: 100vh;
   margin: 0 auto;
   padding: 24px 24px 18px;
+}
+
+.app-shell--workspace {
+  width: min(100%, 1500px);
+}
+
+.app-shell--workspace .site-header {
+  margin-bottom: 14px;
 }
 
 .skip-link {

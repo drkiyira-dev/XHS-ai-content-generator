@@ -1,6 +1,6 @@
 # XHS AI Content Generator
 
-基于 Vue 3、FastAPI、PaddleOCR-VL 和 Qwen3-VL 的单图小红书内容生成全栈应用。页面接收一张图片和可选的主题或名称、目标读者、表达风格，并展示图片理解摘要、标题、正文与话题标签。
+基于 Vue 3、FastAPI、PaddleOCR-VL 和 Qwen3-VL 的单图小红书内容生成全栈应用。页面接收一张图片和可选的主题或名称、目标读者、表达风格，并展示图片理解摘要、标题、正文、话题标签与发布前风险提示。
 
 ## 已实现功能
 
@@ -9,7 +9,7 @@
 - `GET /api/v1/generations/{generation_id}/image-preview`，按当前账号读取去元数据缩略图。
 - `DELETE /api/v1/generations/{generation_id}`，按当前账号软删除一条成功记录。
 - 工具首页包含功能介绍、使用流程、FAQ 和创作入口。
-- 前端使用独立 URL 提供工具首页、生成工作台与历史记录，支持直达、刷新、前进/后退，以及历史缩略图、载回工作台、复制和确认删除。
+- 前端使用独立 URL 提供工具首页、生成工作台与历史记录，支持直达、刷新、前进/后退，以及历史缩略图、载回工作台、复制和确认删除。生成工作台会保留当前稿再生成新版本，并提供会话内的本地编辑与上一版对比；本地编辑不会自动回写历史记录。
 - 可选的本地账号模式支持邮箱注册、登录、刷新恢复会话和退出；生成与历史按当前账号隔离。
 - 当前结果与历史卡片中的图片理解摘要默认收起，可使用原生折叠控件展开查看。
 - 支持 JPG、JPEG、PNG、WebP，以及单帧 HEIC/HEIF；HEIC/HEIF 会在服务端安全转换为 JPEG，
@@ -19,6 +19,12 @@
 - Qwen3-VL 生成固定结构的 `image_summary`、`title`、`body`、`tags`。
 - 输出 JSON 解析、有限重试、最长 20 字标题归一化和 3–5 个标签校验。
 - 对未经图片证实的护肤功效、适用人群、使用感和明显品类冲突进行保守拦截。
+- 支持关闭、轻量、丰富三档确定性 Emoji 风格；可从版本化本地目录补充相关标签，
+  但不冒充实时热门榜，也不会额外调用模型。
+- 使用版本化本地规则提示绝对化承诺、医疗健康、站外导流、诱导互动、虚假背书、
+  竞品贬损和泛流量标签等发布风险；提示不等于小红书平台审核或限流预测。
+- 生成期间显示与结果结构一致的骨架屏；未经完整结构与事实检查的模型片段不会提前展示。
+  当前接口仍返回一次完整 JSON；骨架屏不是 SSE 文案流，避免把可能被后续校验或修复丢弃的片段先展示给用户。
 - 统一处理模型失败、超时、输出无效和服务器内部错误，不向客户端暴露 Key 或堆栈。
 - 成功和失败后都会清理上传及预处理临时文件。
 
@@ -58,7 +64,7 @@ cp frontend/.env.example frontend/.env
 
 前端模板默认连接 `http://127.0.0.1:8000` 的真实 FastAPI；只有显式设置
 `VITE_USE_MOCK=true` 时才使用浏览器内 Mock 数据。前端配置中不得放入硅基流动 API Key
-或数据库密码。
+或数据库密码。Mock 不执行真实识图；它按账号循环三套演示稿，以便验证重新生成和版本对比。
 
 ## 配置环境变量
 
@@ -119,12 +125,17 @@ SILICONFLOW_API_KEY=在此填写真实Key
   [migrations/004_generation_ownership.sql](migrations/004_generation_ownership.sql)
   增加可空的 `generation_records.user_id`、外键和查询索引，随后执行
   [migrations/005_generation_previews_and_deletion.sql](migrations/005_generation_previews_and_deletion.sql)
-  增加持久化受限预览与软删除字段；
+  增加持久化受限预览与软删除字段，最后执行
+  [migrations/006_generation_risk_snapshot.sql](migrations/006_generation_risk_snapshot.sql)
+  增加可空的生成时风险快照；
 - 账号演示时必须同步开启后端 `AUTH_ENABLED` 与前端 `VITE_AUTH_ENABLED`；
 - 远程数据库还必须准备 CA 文件并配置 `DATABASE_TLS_CA`。
 
 迁移文件不会创建、选择或删除数据库，只会在操作者已经明确选中的数据库中创建或变更
 项目表结构。
+运行时 `xhs_app` 账号只有 `SELECT`、`INSERT` 与 `UPDATE`，不能也不应执行 `ALTER`；
+003–006 必须在停写并完成备份后，由具有明确 DDL 授权且已选定目标数据库的独立迁移会话执行，
+验收结构无误后再恢复使用 `xhs_app` 启动应用。
 应用启动本身也不会自动建库、建表或修改 schema。
 
 准备完成后，在本地 `.env` 中填写，不要把密码发送到聊天或提交 Git：
@@ -162,9 +173,9 @@ DATABASE_URL=mysql+pymysql://xhs_app:在此填写密码@127.0.0.1:3306/xhs_ai_te
 `user_id`，旧的 NULL 记录不会自动归给首个注册用户，也不会出现在任何账号的历史记录中。
 
 前端已经接入注册、登录、会话恢复与退出页面，但后端和前端模板仍默认关闭账号模式。
-只有完成受控备份并依次执行 003/004/005 后，才可同时设置后端 `AUTH_ENABLED=true` 与前端
+只有完成受控备份并依次执行 003/004/005/006 后，才可同时设置后端 `AUTH_ENABLED=true` 与前端
 `VITE_AUTH_ENABLED=true`。任何尚未迁移的现有 MySQL 都不能直接运行 owner-aware 代码；
-启动探针会在缺少可空 `user_id`、预览或软删除字段时固定失败，避免到首个请求才暴露旧
+启动探针会在缺少可空 `user_id`、预览、软删除或 JSON 风险快照字段时固定失败，避免到首个请求才暴露旧
 schema 错误。应用启动不会自动补表、迁移或修改旧数据。
 
 迁移已经完成并准备进行本地账号演示时，分别在两个未跟踪配置文件中同步开启：
@@ -202,8 +213,10 @@ XHS_HISTORY_BACKUP_CONFIRM=YES_BACKUP_XHS_AI_HISTORY \
 输出不是交互式终端时会拒绝运行。它只允许固定的 `.local-backups/` 输出位置，不接受
 自定义路径，也不会覆盖已有备份。失败信息不会打印数据库 URL、凭据、SQL 参数或历史内容。
 备份成功只代表旧数据已有可校验副本，不代表数据已经属于任何账号。本项目采用“归档”
-策略：显式依次执行 003、004 与 005 后，旧记录继续保持 `user_id=NULL`，不会猜测归属、
+策略：显式依次执行 003、004、005 与 006 后，旧记录继续保持 `user_id=NULL`，不会猜测归属、
 更新或删除；新增的预览与软删除字段也保持 `NULL`；
+旧记录的风险快照同样保持 `NULL`，历史接口会明确提示无法还原生成时检查结果，不会用
+新版本规则伪装成旧记录当时的结论；
 账号模式下它们对所有用户均不可见。真实备份与迁移必须在停止后端的同一维护窗口内另行
 明确确认，本说明不会自行连接或改动当前 MySQL。
 
@@ -354,14 +367,15 @@ docker compose up --build --detach --wait
 
 首次使用空的 `mysql_data` 卷时，MySQL 官方入口只创建 `xhs_ai`，随后按顺序执行
 `001_generation_records.sql`、`002_create_app_user.sh`、
-`003_auth_tables.sql`、`004_generation_ownership.sql` 与
-`005_generation_previews_and_deletion.sql`。第二个脚本直接创建 `xhs_app`，
+`003_auth_tables.sql`、`004_generation_ownership.sql`、
+`005_generation_previews_and_deletion.sql` 与 `006_generation_risk_snapshot.sql`。第二个脚本直接创建 `xhs_app`，
 第一次授权就只有运行时实际需要的 `SELECT`、`INSERT`、`UPDATE`；不存在先授予 `ALL` 再撤销的
 中断窗口。第三个迁移准备 `users` 与 `auth_sessions`，不会伪造邮箱激活状态；第四个迁移
 为生成记录增加可空的账号外键和历史查询索引，不回填、删除或猜测旧记录归属。FastAPI
 自身仍然只做启动检查，不执行 DDL。第五个迁移把去元数据、受限体积的历史预览保存在
 MySQL 中，并增加可空软删除时间；旧记录的这些字段保持 `NULL`。现有数据卷必须先显式
-执行 005，才能重启使用新版 ORM，Compose 不会自动补跑迁移。
+执行 005。第六个迁移增加可空 JSON 风险快照，保存生成当时的规则版本与提示；旧记录
+不回填。现有数据卷必须继续显式执行 006，才能重启使用新版 ORM，Compose 不会自动补跑迁移。
 
 这些初始化脚本**只会在空数据卷上执行一次**。现有卷不会自动重放迁移；后续 schema
 变更必须使用单独、明确审批的迁移流程。若首次初始化中断或失败，应查看固定错误日志并
@@ -392,6 +406,8 @@ docker compose down --volumes
 | `product_name` | 否 | 主题或名称提示；仅用于调整生成方向，与图片冲突时以图片为准 |
 | `target_audience` | 否 | 目标读者提示；不能作为适用人群的事实证据 |
 | `tone` | 否 | 表达风格提示；不能作为图片事实或产品属性的证据 |
+| `emoji_level` | 否 | `off`、`light` 或 `expressive`；API 默认 `off`，只确定性调整标题和正文，不改图片理解摘要 |
+| `related_tags` | 否 | `true` 或 `false`；API 默认 `false`，只从版本化本地目录补充相关标签，不读取实时热榜 |
 
 curl 示例：
 
@@ -401,10 +417,13 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/generations' \
   -F 'image=@/absolute/path/example.jpg;type=image/jpeg' \
   -F 'product_name=玫瑰果卸妆油' \
   -F 'target_audience=大学生' \
-  -F 'tone=轻松自然'
+  -F 'tone=轻松自然' \
+  -F 'emoji_level=light' \
+  -F 'related_tags=true'
 ```
 
-三个可选字段可以全部省略。
+所有可选字段都可以省略。为保持旧客户端行为，API 在未提交增强字段时不添加 Emoji 或
+相关标签；当前前端工作台默认选择轻量 Emoji 并开启相关标签，用户可以随时关闭。
 
 ## 成功响应
 
@@ -417,11 +436,22 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/generations' \
   "title": "玫瑰果卸妆油开箱",
   "body": "浅粉色瓶身搭配简约标签，包装上可见 CLEANSING OIL、ROSE HIP 和 100 ML。",
   "tags": ["#卸妆油", "#玫瑰果", "#粉色包装", "#护肤分享"],
-  "created_at": "2026-08-07T07:39:32.921950Z"
+  "created_at": "2026-08-07T07:39:32.921950Z",
+  "risk_assessment": {
+    "rule_version": "content-risk-hints-2026-08-14.2",
+    "findings": []
+  }
 }
 ```
 
-`generation_id` 和 `created_at` 每次请求都会变化。
+`generation_id` 和 `created_at` 每次请求都会变化。`risk_assessment` 是本地、非权威的
+发布前提示：没有提示不代表已通过平台审核，出现提示也不等于内容一定会被处罚或限流。
+接口会在完整模型结果通过结构与事实检查并成功保存后一次性返回；页面的加载动画不是
+未经审核的模型 Token 流。
+
+生成字段采用统一的后端硬边界：`image_summary` 最多 2,000 个字符，`title` 最多 20 个字符，
+`body` 最多 10,000 个字符，单个规范化标签最多 100 个字符（包含前导 `#`），标签总数为
+3–5 个。模型解析、成功写库与历史读取都会复验这些限制。
 
 ## 历史记录接口（兼容模式与账号隔离）
 
@@ -437,8 +467,10 @@ GET /api/v1/generations?limit=20
 - 只返回 `success` 记录，按创建时间从新到旧排列。
 - `limit` 默认为 `20`，允许范围为 `1` 到 `50`。
 - 响应沿用生成结果的 `generation_id`、`image_summary`、`title`、`body`、
-  `tags`、`created_at` 字段，每项增加 `has_image_preview` 与受控的
+  `tags`、`created_at`、`risk_assessment` 字段，每项增加 `has_image_preview` 与受控的
   `image_preview_url`，顶层额外返回 `count`。
+- `risk_assessment` 返回生成成功时持久化的规则版本与提示；规则升级不会静默重写旧记录。
+  006 以前的 `NULL` 记录会明确返回“无法还原生成时快照”的提示，而不是按新规则冒充重算结果。
 - 不返回本地图片路径、用户输入、失败原因或数据库内部字段。
 - 响应带有 `Cache-Control: no-store`，避免浏览器或代理缓存生成文案。
 - `DATABASE_ENABLED=false` 时 No-op 持久化不会保存数据，因此历史固定为空。
@@ -457,6 +489,10 @@ GET /api/v1/generations?limit=20
       "body": "包装上可见 CLEANSING OIL、ROSE HIP 和 100 ML。",
       "tags": ["#卸妆油", "#玫瑰果", "#护肤分享"],
       "created_at": "2026-08-07T07:39:32.921950Z",
+      "risk_assessment": {
+        "rule_version": "content-risk-hints-2026-08-14.2",
+        "findings": []
+      },
       "has_image_preview": true,
       "image_preview_url": "/api/v1/generations/550e8400-e29b-41d4-a716-446655440000/image-preview"
     }
@@ -516,6 +552,9 @@ B 侧的 `DATABASE_ERROR` 与成员 C 的适配器已经接通。真实 MySQL �
   → Qwen3-VL 图片理解与文案生成
   → JSON 解析、字段归一化与有限重试
   → 事实安全校验
+  → 可选的确定性 Emoji / 相关标签增强
+  → 结构与事实规则复验
+  → 生成并保存版本化发布风险快照
   → mark_success / mark_failed（MySQL 未显式启用时为 No-op）
   → 返回固定 API 响应
 ```
@@ -537,6 +576,8 @@ python -m pytest
 - EXIF 方向、透明图片、大图缩放、UUID 临时文件和清理。
 - OCR 降级、Qwen 请求、总超时、取消、有限重试和错误映射。
 - JSON/schema 归一化、长标题处理和事实安全校验。
+- 图片理解摘要、正文和单标签长度边界，以及生成时风险快照、旧记录兼容和损坏快照拒绝。
+- 前端路由、账号隔离、Mock 增强、loopback API 边界、按需组件加载和真实 Chrome 主流程。
 
 真实 API 测试会产生模型调用费用；自动化测试默认使用 Mock，不会调用硅基流动。
 
@@ -558,10 +599,12 @@ XHS_MYSQL_LIVE_TEST_CONFIRM=YES_USE_XHS_AI_TEST \
 - `develop` 或 `main` 收到新的提交。
 - 在 GitHub Actions 页面手动触发。
 
-CI 包含四个互相独立的任务：
+CI 包含五个互相独立的任务：
 
 - Python 3.12：安装后端开发依赖并运行全部 `pytest`。
 - Node.js 24：使用 `npm ci` 按锁文件安装前端依赖，并分别验证兼容模式与账号模式的生产构建。
+- Chrome：使用固定模型替身和临时 SQLite，真实验证 HttpOnly Cookie、上传骨架、风险提示、
+  历史缩略图、载回、删除与退出；不会读取根 `.env`、连接开发者 MySQL 或调用第三方模型。
 - Docker：构建后端镜像，以非 root、只读文件系统、无网络和无 Linux capabilities 的
   容器执行 `/api/health` 冒烟检查；只使用无效占位 Key，不连接模型或 MySQL。
 - Docker Compose：使用临时占位 Key、随机数据库密码、内部无外网 bridge 和全新命名卷，

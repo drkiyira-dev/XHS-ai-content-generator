@@ -37,9 +37,13 @@ VITE_AUTH_ENABLED=false
 ```
 
 开发阶段如需切换后端地址，修改 `.env` 即可，不要提交 `.env` 文件到 Git。
-账号模式必须与后端根目录 `.env` 的 `AUTH_ENABLED` 同步：只有数据库已完成
-`003_auth_tables.sql` 与 `004_generation_ownership.sql` 后，才可把两端都设为 `true`。
+账号模式必须与后端根目录 `.env` 的 `AUTH_ENABLED` 同步：只有数据库已依次完成
+`003_auth_tables.sql`、`004_generation_ownership.sql`、
+`005_generation_previews_and_deletion.sql` 与 `006_generation_risk_snapshot.sql` 后，
+才可把两端都设为 `true`。
 前端从不保存会话令牌；浏览器只使用后端设置的 `HttpOnly` Cookie。
+`VITE_API_BASE_URL` 只接受 `http(s)` 的字面 `localhost`、`127.0.0.1` 或 `[::1]` origin；
+携带路径、查询、凭据或非回环主机的配置会在启动时失败，避免误把图片发送到其他服务器。
 
 ### 3. 启动开发服务器
 
@@ -70,6 +74,7 @@ npm run build
 
 ```
 frontend/
+├── e2e/                    # 隔离 Chrome 主流程测试
 ├── public/                 # 静态资源
 ├── src/
 │   ├── App.vue             # 持久应用外壳、共享工作状态与跨账号界面清理
@@ -87,6 +92,7 @@ frontend/
 ├── .env.example            # 环境变量模板
 ├── index.html
 ├── package.json
+├── playwright.config.ts   # 临时 SQLite + 固定模型替身的浏览器测试配置
 ├── tsconfig.json
 ├── vite.config.ts
 └── README.md
@@ -101,9 +107,11 @@ frontend/
 - **图片上传**：支持 JPG、JPEG、PNG、WebP 以及单帧 HEIC/HEIF，最大 10MB。
 - **前端校验**：校验文件扩展名、MIME 类型、文件大小及文件头；HEIC/HEIF 使用有界 `ftyp` 品牌检查并由后端转换为 JPEG。
 - **可选提示**：主题或名称、目标读者、表达风格；接口字段继续使用 `product_name`、`target_audience`、`tone`。
-- **生成结果**：展示图片理解摘要、标题、正文和话题标签。
+- **输出偏好**：可关闭或选择轻量/丰富 Emoji，并可开启本地相关标签；相关标签不是实时热门榜。
+- **生成结果**：先展示版本化的发布前风险提示（非平台审核），再提供标题、正文和话题标签的会话内编辑、当前稿复制与上一版对比。重新生成期间旧稿保持可读，失败不会覆盖；本地编辑不会自动写回历史记录，编辑后原风险快照会明确标记为尚未重新检测。
 - **摘要折叠**：当前结果与历史卡片中的图片理解摘要默认收起，使用原生键盘可操作控件展开。
-- **加载与错误状态**：请求过程中禁用提交按钮，遇到错误展示中文提示。
+- **加载与错误状态**：请求过程中禁用提交按钮，并用结果结构骨架提示正在完成格式与内容检查；遇到错误展示中文提示。
+  当前骨架屏不代表 SSE 文案流；前端只在后端完成结构与内容检查并返回完整结果后展示正文。
 - **历史记录**：主动进入后读取当前账号最近 20 条成功记录，支持缩略图/占位、载回工作台、复制、刷新和确认删除。
 - **状态隔离**：同一账号切换路由时由应用外壳保留工作状态；退出、会话失效或账号变化会清除私有界面数据，并丢弃旧请求的迟到响应。工作区不写入浏览器持久存储，刷新页面会清空未提交草稿。
 
@@ -112,16 +120,29 @@ frontend/
 `src/services/generation.ts` 默认通过 `POST /api/v1/generations` 调用真实后端。只有显式设置
 `VITE_USE_MOCK=true` 时才使用本地 Mock 数据；接口字段保持 snake_case：
 
+Mock 不会分析上传图片，也不代表真实模型耗时或质量。为便于检查版本功能，同一账号会按顺序
+循环三套明确标注的演示稿；标题、正文和标签会变化，图片摘要固定说明“未真实识图”。
+
 ```json
 {
   "generation_id": "uuid",
   "image_summary": "图片理解摘要",
   "title": "生成标题",
   "body": "生成正文",
-  "tags": ["#标签1", "#标签2"],
-  "created_at": "2024-01-01T00:00:00Z"
+  "tags": ["#标签1", "#标签2", "#标签3"],
+  "created_at": "2024-01-01T00:00:00Z",
+  "risk_assessment": {
+    "rule_version": "content-risk-hints-2026-08-14.2",
+    "findings": []
+  }
 }
 ```
+
+生成请求另外提交 `emoji_level` 与 `related_tags`。前端默认使用 `light` 和 `true`，用户可在
+工作台切换；后端 API 对未提交这两个字段的旧客户端保持 `off` 与 `false`。风险提示仅由
+本地规则提供人工核对线索，不预测小红书限流，也不代表平台审核结论。
+历史记录展示生成时保存的风险快照，不会因规则升级而静默变化；没有旧快照时会显示明确的
+人工复核提示。
 
 历史页通过 `GET /api/v1/generations?limit=20` 读取本地 MySQL 中最近成功的结果，并使用
 owner-scoped `GET /api/v1/generations/{generation_id}/image-preview` 显示缩略图；删除使用

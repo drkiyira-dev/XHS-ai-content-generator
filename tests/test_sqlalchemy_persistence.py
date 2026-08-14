@@ -25,7 +25,12 @@ from backend.services.persistence import (
     SQLAlchemyGenerationPersistence,
     SuccessfulGeneration,
 )
-from tests.support import build_test_app, make_image_bytes, send_request
+from tests.support import (
+    TEST_RISK_SNAPSHOT,
+    build_test_app,
+    make_image_bytes,
+    send_request,
+)
 
 
 TEST_USER_ID = 101
@@ -188,6 +193,7 @@ def test_adapter_rolls_back_invalid_copy_and_returns_one_sanitized_error(
         ),
         body="正文内容",
         tags=("#一", "#二", "#三"),
+        risk_assessment=TEST_RISK_SNAPSHOT,
     )
 
     with persistence_database(tmp_path) as (adapter, factory):
@@ -246,6 +252,7 @@ def test_adapter_uses_injected_clock_and_stores_it_as_utc(
         title="标题",
         body="正文内容",
         tags=("#一", "#二", "#三"),
+        risk_assessment=TEST_RISK_SNAPSHOT,
     )
 
     with persistence_database(
@@ -372,6 +379,7 @@ def test_adapter_lists_only_the_requested_users_successes(
                         title=f"标题{index}",
                         body=f"正文内容{index}",
                         tags=("#一", "#二", "#三"),
+                        risk_assessment=TEST_RISK_SNAPSHOT,
                     )
                 )
             )
@@ -401,6 +409,7 @@ def test_adapter_wrong_owner_transition_is_sanitized_and_does_not_write(
         title="标题",
         body="正文内容",
         tags=("#一", "#二", "#三"),
+        risk_assessment=TEST_RISK_SNAPSHOT,
     )
 
     with persistence_database(tmp_path) as (adapter, factory):

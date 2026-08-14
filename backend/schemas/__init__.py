@@ -7,6 +7,11 @@ adapter must translate them before they can reach FastAPI.
 
 from typing import Any
 
+from backend.schemas.risk_snapshot import (
+    RiskAssessmentSnapshot,
+    RiskFindingSnapshot,
+)
+
 
 class ErrorCode:
     """Stable codes raised by the database core."""
@@ -32,4 +37,9 @@ class BusinessException(Exception):
         super().__init__(message)
 
 
-__all__ = ["BusinessException", "ErrorCode"]
+__all__ = [
+    "BusinessException",
+    "ErrorCode",
+    "RiskAssessmentSnapshot",
+    "RiskFindingSnapshot",
+]

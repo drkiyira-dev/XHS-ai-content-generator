@@ -49,6 +49,7 @@ def test_account_revision_synchronously_clears_every_private_workspace_value() -
     app_source = APP_VUE.read_text(encoding="utf-8")
     auth_source = AUTH_STATE.read_text(encoding="utf-8")
     reset = _function_body(app_source, "resetAccountScopedState")
+    clear_result = _function_body(app_source, "clearGenerationResult")
 
     for required_clear in (
         "generationRequestId += 1",
@@ -59,6 +60,8 @@ def test_account_revision_synchronously_clears_every_private_workspace_value() -
         "form.productName = ''",
         "form.targetAudience = ''",
         "form.tone = ''",
+        "form.emojiLevel = 'light'",
+        "form.relatedTags = true",
         "historyItems.value = []",
         "historyCount.value = 0",
         "historyError.value = ''",
@@ -68,6 +71,12 @@ def test_account_revision_synchronously_clears_every_private_workspace_value() -
         "historyStatus.value = 'idle'",
     ):
         assert required_clear in reset
+
+    assert "currentVersion.value = null" in clear_result
+    assert "previousVersion.value = null" in clear_result
+    assert "status.value = 'idle'" in clear_result
+    assert reset.index("generationRequestId += 1") < reset.index("clearImage()")
+    assert reset.index("clearImage()") < reset.index("clearGenerationResult()")
 
     assert "watch(authRevision, resetAccountScopedState, { flush: 'sync' })" in app_source
     assert app_source.count("resetAccountScopedState") == 2
@@ -80,6 +89,30 @@ def test_account_revision_synchronously_clears_every_private_workspace_value() -
     assert "user.value !== null" in install_anonymous
     assert "revision.value += 1" in install_anonymous
     assert "revision.value += 1" in expire
+
+
+def test_workspace_keeps_server_snapshots_and_local_drafts_account_scoped() -> None:
+    app_source = APP_VUE.read_text(encoding="utf-8")
+    workspace_source = WORKSPACE_STATE.read_text(encoding="utf-8")
+    clear_result = _function_body(app_source, "clearGenerationResult")
+    copy_all = _function_body(app_source, "copyAll")
+
+    for contract in (
+        "export interface EditableGenerationDraft",
+        "export interface SubmittedGenerationConfig",
+        "export interface WorkspaceVersion",
+        "server: GenerationResponse",
+        "draft: EditableGenerationDraft",
+        "currentVersion: Ref<WorkspaceVersion | null>",
+        "previousVersion: Ref<WorkspaceVersion | null>",
+        "configState: ComputedRef<GenerationConfigState>",
+        "draftDirty: ComputedRef<boolean>",
+    ):
+        assert contract in workspace_source
+
+    assert "currentVersion.value = null" in clear_result
+    assert "previousVersion.value = null" in clear_result
+    assert "void copyDraft(currentVersion.value.draft)" in copy_all
 
 
 def test_delayed_generation_and_history_responses_are_session_versioned() -> None:

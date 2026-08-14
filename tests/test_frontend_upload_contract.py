@@ -71,6 +71,27 @@ def test_frontend_heif_check_matches_the_backend_brand_boundary() -> None:
     assert "浏览器不直接预览此格式，将由后端安全转换为 JPEG" in view_source
 
 
+def test_heif_uses_an_accessible_nonvisual_placeholder_and_upload_discloses_data_flow() -> None:
+    view_source = GENERATE_VIEW.read_text(encoding="utf-8")
+
+    heif_start = view_source.index('v-if="imageIsHeif"')
+    image_fallback = view_source.index("<img", heif_start)
+    heif_branch = view_source[heif_start:image_fallback]
+
+    assert 'class="heif-preview"' in heif_branch
+    assert 'role="img"' in heif_branch
+    assert 'aria-label="HEIC 或 HEIF 图片已选择"' in heif_branch
+    assert "<Picture />" in heif_branch
+    assert 'aria-hidden="true"' in heif_branch
+    assert "浏览器不直接预览此格式，将由后端安全转换为 JPEG" in heif_branch
+
+    assert 'aria-describedby="upload-help upload-privacy-help"' in view_source
+    assert 'id="upload-help"' in view_source
+    assert 'id="upload-privacy-help"' in view_source
+    assert "图片会经本地后端发送至已配置的第三方视觉模型服务" in view_source
+    assert "请勿上传敏感或无授权图片" in view_source
+
+
 def test_upload_internal_queue_is_reset_through_the_workspace_epoch() -> None:
     app_source = APP_VUE.read_text(encoding="utf-8")
     view_source = GENERATE_VIEW.read_text(encoding="utf-8")

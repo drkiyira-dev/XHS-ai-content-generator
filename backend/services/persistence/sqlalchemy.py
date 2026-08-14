@@ -8,6 +8,7 @@ from uuid import UUID
 from anyio import CapacityLimiter, to_thread
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
+from pydantic import ValidationError
 
 from backend.db import (
     GenerationRecord,
@@ -28,6 +29,7 @@ from backend.services.persistence.types import (
     StoredImagePreview,
     SuccessfulGeneration,
 )
+from backend.schemas import RiskAssessmentSnapshot
 from backend.validation import validate_copy
 
 
@@ -203,6 +205,7 @@ class SQLAlchemyGenerationPersistence:
                 title=record.title,
                 body=record.body,
                 tags=record.tags,
+                risk_assessment=record.risk_assessment,
                 completed_at=self._clock(),
                 image_preview=record.image_preview,
                 image_preview_media_type=record.image_preview_media_type,
@@ -267,6 +270,7 @@ class SQLAlchemyGenerationPersistence:
             body=record.content,
             tags=record.tags,
         )
+        risk_assessment = _parse_stored_risk_assessment(record.risk_assessment)
         if (
             summary != record.image_description
             or title != record.title
@@ -291,6 +295,7 @@ class SQLAlchemyGenerationPersistence:
             body=body,
             tags=tuple(tags),
             created_at=created_at,
+            risk_assessment=risk_assessment,
             has_image_preview=(
                 record.image_preview_media_type in {"image/jpeg", "image/webp"}
             ),
@@ -415,3 +420,20 @@ def _extract_image_preview(
             and content[8:12] == b"WEBP"
         )
     return (content, media_type) if valid else None
+
+
+def _parse_stored_risk_assessment(
+    value: object,
+) -> RiskAssessmentSnapshot | None:
+    """Accept NULL legacy rows, while failing closed on corrupt snapshots."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("stored risk assessment is not an object")
+    try:
+        snapshot = RiskAssessmentSnapshot.model_validate(value, strict=False)
+    except ValidationError as error:
+        raise ValueError("stored risk assessment is invalid") from error
+    if snapshot.model_dump(mode="json") != value:
+        raise ValueError("stored risk assessment is not normalized")
+    return snapshot
