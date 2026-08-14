@@ -24,6 +24,7 @@ from backend.db import (
 )
 from backend.schemas import BusinessException, ErrorCode
 from backend.validation import validate_generation_result
+from tests.support import TEST_RISK_SNAPSHOT
 
 
 TEST_USER_ID = 101
@@ -108,6 +109,7 @@ def test_success_runs_c_validation_and_cannot_be_reversed(tmp_path: Path) -> Non
                 title="海边帆布包",
                 body="白色包身放在浅色沙滩上。",
                 tags=("帆布包", "#海边", "帆布包", "日常穿搭"),
+                risk_assessment=TEST_RISK_SNAPSHOT,
                 completed_at=created_at + timedelta(seconds=2),
             )
 
@@ -155,6 +157,7 @@ def test_same_session_transition_refreshes_the_loaded_pending_record(
                 title="白色包袋",
                 body="白色包身配有黑色提手。",
                 tags=("#包袋", "#通勤", "#日常"),
+                risk_assessment=TEST_RISK_SNAPSHOT,
                 completed_at=created_at + timedelta(seconds=1),
             )
 
@@ -195,6 +198,7 @@ def test_failure_stores_only_stable_code_and_cannot_be_reversed(
                     title="标题",
                     body="正文内容",
                     tags=("#一", "#二", "#三"),
+                    risk_assessment=TEST_RISK_SNAPSHOT,
                     completed_at=created_at + timedelta(seconds=3),
                 )
 
@@ -225,6 +229,7 @@ def test_invalid_copy_leaves_the_database_record_pending(tmp_path: Path) -> None
                     ),
                     body="正文内容",
                     tags=("#一", "#二", "#三"),
+                    risk_assessment=TEST_RISK_SNAPSHOT,
                     completed_at=created_at + timedelta(seconds=2),
                 )
 
@@ -411,6 +416,7 @@ def test_repository_hides_another_users_record_and_rejects_transition(
                     title="标题",
                     body="正文内容",
                     tags=("#一", "#二", "#三"),
+                    risk_assessment=TEST_RISK_SNAPSHOT,
                     completed_at=created_at + timedelta(seconds=1),
                 )
 

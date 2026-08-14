@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APP_VUE = ROOT / "frontend" / "src" / "App.vue"
 GENERATE_VIEW = ROOT / "frontend" / "src" / "views" / "GenerateView.vue"
 HISTORY_VIEW = ROOT / "frontend" / "src" / "views" / "HistoryView.vue"
+WORKSPACE_STATE = ROOT / "frontend" / "src" / "state" / "workspace.ts"
 
 
 def _disclosure_for(source: str, binding: str) -> str:
@@ -39,7 +40,7 @@ def test_current_and_history_summaries_use_native_closed_disclosures() -> None:
     generate_source = GENERATE_VIEW.read_text(encoding="utf-8")
     history_source = HISTORY_VIEW.read_text(encoding="utf-8")
 
-    current = _disclosure_for(generate_source, "result.image_summary")
+    current = _disclosure_for(generate_source, "currentVersion.server.image_summary")
     history = _disclosure_for(history_source, "item.image_summary")
 
     for disclosure in (current, history):
@@ -54,22 +55,38 @@ def test_current_and_history_summaries_use_native_closed_disclosures() -> None:
     assert ':aria-label="`图片理解摘要：${item.title}`"' in history
 
 
-def test_summary_text_is_safely_rendered_and_does_not_change_copy_contract() -> None:
+def test_summary_is_a_read_only_server_field_and_does_not_change_copy_contract() -> None:
     app_source = APP_VUE.read_text(encoding="utf-8")
     generate_source = GENERATE_VIEW.read_text(encoding="utf-8")
     history_source = HISTORY_VIEW.read_text(encoding="utf-8")
+    workspace_source = WORKSPACE_STATE.read_text(encoding="utf-8")
 
-    assert "{{ result.image_summary }}" in generate_source
+    assert "{{ currentVersion.server.image_summary }}" in generate_source
     assert "{{ item.image_summary }}" in history_source
     for source in (generate_source, history_source):
         assert "v-html" not in source
         assert "innerHTML" not in source
 
+    draft_contract = re.search(
+        r"export interface EditableGenerationDraft \{(?P<body>.*?)\n\}",
+        workspace_source,
+        flags=re.DOTALL,
+    )
+    assert draft_contract is not None
+    assert "image_summary" not in draft_contract.group("body")
+    assert 'v-model="currentVersion.server.image_summary"' not in generate_source
+    assert "currentVersion.draft.image_summary" not in generate_source
+
     copy_generation = _function_body(app_source, "copyGeneration")
+    copy_draft = _function_body(app_source, "copyDraft")
     assert "generation.title" in copy_generation
     assert "generation.body" in copy_generation
     assert "generation.tags" in copy_generation
     assert "generation.image_summary" not in copy_generation
+    assert "draft.title" in copy_draft
+    assert "draft.body" in copy_draft
+    assert "draft.tags" in copy_draft
+    assert "draft.image_summary" not in copy_draft
 
 
 def test_disclosures_have_mobile_safe_text_and_keyboard_focus_styles() -> None:

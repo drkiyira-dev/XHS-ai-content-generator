@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { onMounted } from 'vue'
-import { ElMessageBox } from 'element-plus'
+import {
+  ElAlert,
+  ElButton,
+  ElEmpty,
+  ElMessageBox,
+  ElSkeleton,
+  ElTag
+} from 'element-plus'
 import { Delete, DocumentCopy, RefreshRight } from '@element-plus/icons-vue'
 
 import { AUTH_ENABLED } from '../services/api'
@@ -142,7 +149,16 @@ onMounted(() => {
             <div class="history-item-header">
               <div>
                 <h2>{{ item.title }}</h2>
-                <time :datetime="item.created_at">{{ formatCreatedAt(item.created_at) }}</time>
+                <div class="history-item-meta">
+                  <time :datetime="item.created_at">{{ formatCreatedAt(item.created_at) }}</time>
+                  <el-tag
+                    :type="item.risk_assessment.findings.length > 0 ? 'warning' : 'info'"
+                    size="small"
+                    effect="plain"
+                  >
+                    发布前风险提示 {{ item.risk_assessment.findings.length }} 项 · 非平台审核
+                  </el-tag>
+                </div>
               </div>
               <div class="history-actions">
                 <el-button
@@ -348,6 +364,13 @@ onMounted(() => {
 .history-item-header time {
   color: #6b7280;
   font-size: 13px;
+}
+
+.history-item-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .image-summary-details {

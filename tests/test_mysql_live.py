@@ -27,7 +27,12 @@ from backend.services.persistence import (
 from backend.services.persistence.runtime import (
     create_sqlalchemy_persistence_runtime,
 )
-from tests.support import StubModelService, make_image_bytes, send_request
+from tests.support import (
+    TEST_RISK_SNAPSHOT,
+    StubModelService,
+    make_image_bytes,
+    send_request,
+)
 
 
 LIVE_CONFIRM_NAME = "XHS_MYSQL_LIVE_TEST_CONFIRM"
@@ -272,6 +277,7 @@ async def _exercise_terminal_race(
             title="MySQL并发测试",
             body="用于验证 pending 只能进入一个终态。",
             tags=("#MySQL测试", "#并发测试", "#状态测试"),
+            risk_assessment=TEST_RISK_SNAPSHOT,
         )
         failed = FailedGeneration(
             generation_id=str(generation_id),

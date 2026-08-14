@@ -28,6 +28,11 @@ from backend.services.model.types import (
     GENERATED_TITLE_MAX_LENGTH,
     GeneratedCopy,
 )
+from backend.validation import (
+    MAX_BODY_LENGTH,
+    MAX_IMAGE_SUMMARY_LENGTH,
+    MAX_TAG_LENGTH,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,7 @@ SchemaDetail = Literal[
     "missing_field",
     "extra_field",
     "field_type",
+    "field_length",
     "empty_text",
     "tag_count",
     "invalid_tags",
@@ -428,7 +434,8 @@ def _build_user_prompt(
   "tags": ["#标签1", "#标签2", "#标签3"]
 }}
 
-tags 必须为 3–5 个字符串，每个以 # 开头，并遵守上述证据边界。
+image_summary 不得超过 {MAX_IMAGE_SUMMARY_LENGTH} 个字符，body 不得超过 {MAX_BODY_LENGTH} 个字符。
+tags 必须为 3–5 个字符串，每个以 # 开头、包含 # 在内不得超过 {MAX_TAG_LENGTH} 个字符，并遵守上述证据边界。
 不得生成暗示未经证实适用性的标签，例如 #敏肌护肤。
 用户提供的信息也可能错误；任何信息无法由图片确认时，都不要自行补造。{retry_note}"""
 
@@ -513,8 +520,10 @@ def _classify_schema_errors(
             details.add("tag_count")
         elif field == "tags" and error_type == "value_error":
             details.add("invalid_tags")
-        elif error_type in {"string_too_short", "string_too_long"}:
+        elif error_type == "string_too_short":
             details.add("empty_text")
+        elif error_type == "string_too_long":
+            details.add("field_length")
         elif error_type in {
             "string_type",
             "tuple_type",

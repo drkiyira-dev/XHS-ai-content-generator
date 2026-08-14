@@ -560,7 +560,8 @@ def test_generation_only_probe_requires_owner_column_but_not_auth_tables(
             "id INTEGER PRIMARY KEY, user_id INTEGER NULL, "
             "image_preview BLOB NULL, "
             "image_preview_media_type TEXT NULL, "
-            "deleted_at TEXT NULL)"
+            "deleted_at TEXT NULL, "
+            "risk_assessment JSON NULL)"
         )
     factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
     limiter = CapacityLimiter(1)
@@ -581,7 +582,12 @@ def test_generation_only_probe_requires_owner_column_but_not_auth_tables(
 
 @pytest.mark.parametrize(
     "missing_column",
-    ["image_preview", "image_preview_media_type", "deleted_at"],
+    [
+        "image_preview",
+        "image_preview_media_type",
+        "deleted_at",
+        "risk_assessment",
+    ],
 )
 def test_generation_probe_rejects_each_missing_history_lifecycle_column(
     tmp_path: Path,
@@ -591,6 +597,7 @@ def test_generation_probe_rejects_each_missing_history_lifecycle_column(
         "image_preview": "image_preview BLOB NULL",
         "image_preview_media_type": "image_preview_media_type TEXT NULL",
         "deleted_at": "deleted_at TEXT NULL",
+        "risk_assessment": "risk_assessment JSON NULL",
     }
     selected = [
         definition
@@ -630,6 +637,7 @@ def test_generation_probe_rejects_each_missing_history_lifecycle_column(
         ("image_preview", "BLOB"),
         ("image_preview_media_type", "TEXT"),
         ("deleted_at", "TEXT"),
+        ("risk_assessment", "JSON"),
     ],
 )
 def test_generation_probe_rejects_non_nullable_history_lifecycle_columns(
@@ -641,6 +649,7 @@ def test_generation_probe_rejects_non_nullable_history_lifecycle_columns(
         "image_preview": "image_preview BLOB NULL",
         "image_preview_media_type": "image_preview_media_type TEXT NULL",
         "deleted_at": "deleted_at TEXT NULL",
+        "risk_assessment": "risk_assessment JSON NULL",
     }
     definitions[column_name] = f"{column_name} {column_type} NOT NULL"
     engine = create_engine(
@@ -653,6 +662,38 @@ def test_generation_probe_rejects_non_nullable_history_lifecycle_columns(
             "id INTEGER PRIMARY KEY, user_id INTEGER NULL, "
             + ", ".join(definitions.values())
             + ")"
+        )
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    limiter = CapacityLimiter(1)
+    runtime = SQLAlchemyPersistenceRuntime(
+        engine,
+        SQLAlchemyGenerationPersistence(factory, limiter=limiter),
+        limiter=limiter,
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(DatabaseStartupError):
+            await runtime.startup()
+        await runtime.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_generation_probe_rejects_non_json_risk_snapshot_column(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'risk-snapshot-text.sqlite3'}",
+        connect_args={"check_same_thread": False},
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE generation_records ("
+            "id INTEGER PRIMARY KEY, user_id INTEGER NULL, "
+            "image_preview BLOB NULL, "
+            "image_preview_media_type TEXT NULL, "
+            "deleted_at TEXT NULL, "
+            "risk_assessment TEXT NULL)"
         )
     factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
     limiter = CapacityLimiter(1)

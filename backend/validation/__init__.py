@@ -12,6 +12,10 @@ from backend.schemas import BusinessException, ErrorCode
 
 
 MAX_TITLE_LENGTH = 20
+MAX_IMAGE_SUMMARY_LENGTH = 2_000
+MAX_BODY_LENGTH = 10_000
+# Length of the normalized public tag, including its single leading ``#``.
+MAX_TAG_LENGTH = 100
 MIN_TAGS_COUNT = 3
 MAX_TAGS_COUNT = 5
 
@@ -37,6 +41,12 @@ def normalize_tags(tags: Iterable[Any] | None) -> list[str]:
         normalized = tag.strip().strip("#").strip()
         if not normalized or normalized in seen:
             continue
+        if len(f"#{normalized}") > MAX_TAG_LENGTH:
+            raise BusinessException(
+                ErrorCode.VALIDATION_ERROR,
+                "文案规则校验失败",
+                {"tags": f"每个标签不能超过 {MAX_TAG_LENGTH} 字"},
+            )
         seen.add(normalized)
         normalized_tags.append(f"#{normalized}")
     return normalized_tags
@@ -61,6 +71,13 @@ def validate_copy(
         empty_message="图片描述不能为空",
         errors=errors,
     )
+    if (
+        normalized_summary
+        and len(normalized_summary) > MAX_IMAGE_SUMMARY_LENGTH
+    ):
+        errors["image_summary"] = (
+            f"图片描述不能超过 {MAX_IMAGE_SUMMARY_LENGTH} 字"
+        )
 
     normalized_title = _normalize_required_text(
         title,
@@ -78,6 +95,8 @@ def validate_copy(
         empty_message="正文不能为空",
         errors=errors,
     )
+    if normalized_body and len(normalized_body) > MAX_BODY_LENGTH:
+        errors["body"] = f"正文不能超过 {MAX_BODY_LENGTH} 字"
 
     normalized_tags = normalize_tags(tags)
     if not MIN_TAGS_COUNT <= len(normalized_tags) <= MAX_TAGS_COUNT:
@@ -144,6 +163,9 @@ def validate_generation_result(result: Mapping[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
+    "MAX_BODY_LENGTH",
+    "MAX_IMAGE_SUMMARY_LENGTH",
+    "MAX_TAG_LENGTH",
     "MAX_TAGS_COUNT",
     "MAX_TITLE_LENGTH",
     "MIN_TAGS_COUNT",

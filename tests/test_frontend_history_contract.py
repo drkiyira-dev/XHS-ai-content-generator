@@ -178,17 +178,35 @@ def test_history_restore_keeps_remote_preview_non_submittable_and_invalidates_ge
     restore = _function_body(app_source, "restoreHistoryItem")
 
     assert restore.index("generationRequestId += 1") < restore.index("clearImage()")
-    assert "Object.assign(result" in restore
+    assert "currentVersion.value = createWorkspaceVersion({" in restore
     assert "tags: [...generation.tags]" in restore
+    assert "}, null, 'history')" in restore
+    assert "previousVersion.value = null" in restore
     assert "imageFile.value = null" in restore
     assert "generation.image_preview_url ?? ''" in restore
+    assert "imageIsHeif.value = false" in restore
     assert "restoredFromHistory.value = true" in restore
     assert "status.value = 'success'" in restore
     assert "await router.push({ name: 'generate' })" in restore
 
-    assert "历史图片仅用于预览" in view_source
-    assert "不会把它当作可再次提交的本地文件" in view_source
-    assert ':disabled="!imageFile"' in view_source
+    assert "这张图片仅用于回忆与预览" in view_source
+    assert "重新生成前仍需重新上传本地图片" in view_source
+    assert ':disabled="!imageFile || isGenerating"' in view_source
+
+
+def test_history_restore_marks_unknown_submission_source_without_mutating_server_snapshot() -> None:
+    app_source = APP_VUE.read_text(encoding="utf-8")
+    workspace_source = WORKSPACE_STATE.read_text(encoding="utf-8")
+    restore = _function_body(app_source, "restoreHistoryItem")
+    create_version = _function_body(app_source, "createWorkspaceVersion")
+
+    assert "submitted: SubmittedGenerationConfig | null" in workspace_source
+    assert "source: 'generated' | 'history'" in workspace_source
+    assert "}, null, 'history')" in restore
+    assert "submitted: submitted === null ? null : { ...submitted }" in create_version
+    assert "source" in create_version
+    assert "server: cloneGenerationResponse" not in restore
+    assert "currentVersion.value.draft" not in restore
 
 
 def test_delete_installs_local_mutation_only_after_success_and_is_session_versioned() -> None:

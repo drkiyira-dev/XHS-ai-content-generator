@@ -10,12 +10,14 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.db import Base, GenerationRecord, MAX_IMAGE_PREVIEW_BYTES
+from backend.schemas import RiskAssessmentSnapshot
 from backend.services.persistence import (
     GenerationPersistenceError,
     PendingGeneration,
     SQLAlchemyGenerationPersistence,
     SuccessfulGeneration,
 )
+from tests.support import TEST_RISK_SNAPSHOT
 
 
 TEST_USER_ID = 101
@@ -53,6 +55,7 @@ async def _seed_success(
             title="湖畔慢时光",
             body="山林倒映在清澈湖面，适合记录一段安静旅程。",
             tags=("#湖景", "#山林", "#旅行"),
+            risk_assessment=TEST_RISK_SNAPSHOT,
             image_preview=preview,
             image_preview_media_type=media_type,
         )
@@ -62,7 +65,7 @@ async def _seed_success(
 def test_preview_is_private_owner_scoped_and_history_only_has_boolean(
     tmp_path: Path,
 ) -> None:
-    adapter, _factory, engine = _build_adapter(tmp_path)
+    adapter, factory, engine = _build_adapter(tmp_path)
     generation_id = str(uuid4())
     try:
         asyncio.run(
@@ -88,11 +91,19 @@ def test_preview_is_private_owner_scoped_and_history_only_has_boolean(
                 user_id=OTHER_USER_ID,
             )
         )
+        with factory() as session:
+            raw_snapshot = session.execute(
+                select(GenerationRecord.risk_assessment).where(
+                    GenerationRecord.task_id == generation_id
+                )
+            ).scalar_one()
     finally:
         engine.dispose()
 
     assert len(history) == 1
     assert history[0].has_image_preview is True
+    assert history[0].risk_assessment == TEST_RISK_SNAPSHOT
+    assert raw_snapshot == TEST_RISK_SNAPSHOT.model_dump(mode="json")
     assert not hasattr(history[0], "image_preview")
     assert owned is not None
     assert owned.content == JPEG_PREVIEW
@@ -154,6 +165,11 @@ def test_soft_delete_is_owner_scoped_idempotent_and_clears_user_content(
             )
         )
         with factory() as session:
+            snapshot_is_sql_null = session.execute(
+                select(GenerationRecord.risk_assessment.is_(None)).where(
+                    GenerationRecord.task_id == generation_id
+                )
+            ).scalar_one()
             raw = session.execute(
                 select(GenerationRecord).where(
                     GenerationRecord.task_id == generation_id
@@ -168,6 +184,8 @@ def test_soft_delete_is_owner_scoped_idempotent_and_clears_user_content(
             assert raw.title is None
             assert raw.content is None
             assert raw.tags is None
+            assert raw.risk_assessment is None
+            assert snapshot_is_sql_null is True
     finally:
         engine.dispose()
 
@@ -177,6 +195,114 @@ def test_soft_delete_is_owner_scoped_idempotent_and_clears_user_content(
     assert history == ()
     assert visible is None
     assert preview is None
+
+
+def test_legacy_null_snapshot_is_preserved_but_malformed_json_fails_closed(
+    tmp_path: Path,
+) -> None:
+    adapter, factory, engine = _build_adapter(tmp_path)
+    legacy_id = str(uuid4())
+    malformed_id = str(uuid4())
+    created_at = datetime.now(UTC).replace(tzinfo=None)
+    try:
+        with factory.begin() as session:
+            for generation_id, snapshot in (
+                (legacy_id, None),
+                (
+                    malformed_id,
+                    {
+                        "rule_version": "bad-test-v1",
+                        "findings": [{"code": "missing-required-fields"}],
+                    },
+                ),
+            ):
+                session.add(
+                    GenerationRecord(
+                        task_id=generation_id,
+                        user_id=TEST_USER_ID,
+                        status="success",
+                        image_description="图片摘要",
+                        title="标题",
+                        content="正文内容",
+                        tags=["#一", "#二", "#三"],
+                        risk_assessment=snapshot,
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+
+        legacy = asyncio.run(
+            adapter.get_successful(
+                generation_id=legacy_id,
+                user_id=TEST_USER_ID,
+            )
+        )
+        with pytest.raises(GenerationPersistenceError) as caught:
+            asyncio.run(
+                adapter.get_successful(
+                    generation_id=malformed_id,
+                    user_id=TEST_USER_ID,
+                )
+            )
+        with factory() as session:
+            legacy_snapshot_is_sql_null = session.execute(
+                select(GenerationRecord.risk_assessment.is_(None)).where(
+                    GenerationRecord.task_id == legacy_id
+                )
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert legacy is not None
+    assert legacy.risk_assessment is None
+    assert legacy_snapshot_is_sql_null is True
+    assert str(caught.value) == "generation persistence failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_invalid_new_snapshot_cannot_complete_a_pending_record(
+    tmp_path: Path,
+) -> None:
+    adapter, factory, engine = _build_adapter(tmp_path)
+    generation_id = str(uuid4())
+    created_at = datetime.now(UTC)
+    invalid_snapshot = RiskAssessmentSnapshot.model_construct(
+        rule_version="",
+        findings=(),
+    )
+    try:
+        asyncio.run(
+            adapter.create_pending(
+                PendingGeneration(generation_id, TEST_USER_ID, created_at)
+            )
+        )
+        with pytest.raises(GenerationPersistenceError) as caught:
+            asyncio.run(
+                adapter.mark_success(
+                    SuccessfulGeneration(
+                        generation_id=generation_id,
+                        user_id=TEST_USER_ID,
+                        image_summary="图片摘要",
+                        title="标题",
+                        body="正文内容",
+                        tags=("#一", "#二", "#三"),
+                        risk_assessment=invalid_snapshot,
+                    )
+                )
+            )
+        with factory() as session:
+            raw = session.execute(
+                select(GenerationRecord).where(
+                    GenerationRecord.task_id == generation_id
+                )
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert str(caught.value) == "generation persistence failed"
+    assert raw.status == "pending"
+    assert raw.risk_assessment is None
 
 
 @pytest.mark.parametrize(
@@ -213,6 +339,7 @@ def test_invalid_preview_pair_rolls_back_success_without_details(
                         title="标题",
                         body="正文内容",
                         tags=("#一", "#二", "#三"),
+                        risk_assessment=TEST_RISK_SNAPSHOT,
                         image_preview=preview,
                         image_preview_media_type=media_type,
                     )

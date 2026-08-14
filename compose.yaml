@@ -46,6 +46,10 @@ services:
         source: ./migrations/005_generation_previews_and_deletion.sql
         target: /docker-entrypoint-initdb.d/005_generation_previews_and_deletion.sql
         read_only: true
+      - type: bind
+        source: ./migrations/006_generation_risk_snapshot.sql
+        target: /docker-entrypoint-initdb.d/006_generation_risk_snapshot.sql
+        read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
       - /var/run/mysqld:rw,noexec,nosuid,nodev,size=16m,uid=999,gid=999,mode=0750

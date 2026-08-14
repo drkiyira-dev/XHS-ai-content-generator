@@ -192,6 +192,8 @@ def test_persistence_smoke_checks_only_fixed_local_database_invariants() -> None
     assert 'await persistence.create_pending(' in source
     assert 'await persistence.mark_success(' in source
     assert 'user_id=None' in source
+    assert 'risk_assessment=EXPECTED_RISK_ASSESSMENT' in source
+    assert 'record.risk_assessment == EXPECTED_RISK_ASSESSMENT' in source
     assert 'await persistence.list_successful(user_id=None, limit=50)' in source
     assert 'Path("/run/xhs/uploads")' in source
     assert imported_modules == {
@@ -204,6 +206,7 @@ def test_persistence_smoke_checks_only_fixed_local_database_invariants() -> None
         "anyio",
         "sqlalchemy",
         "backend.core.config",
+        "backend.schemas",
         "backend.services.persistence",
         "backend.services.persistence.runtime",
     }
@@ -261,6 +264,11 @@ def test_persistence_smoke_payload_is_valid_before_ci_reaches_mysql() -> None:
         compose_runtime_smoke.EXPECTED_BODY,
         list(compose_runtime_smoke.EXPECTED_TAGS),
     )
+    assert (
+        compose_runtime_smoke.EXPECTED_RISK_ASSESSMENT.rule_version
+        == "compose-ci-risk-v1"
+    )
+    assert compose_runtime_smoke.EXPECTED_RISK_ASSESSMENT.findings == ()
 
 
 def test_persistence_smoke_cli_write_and_read_protocol(

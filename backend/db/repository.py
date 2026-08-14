@@ -17,7 +17,11 @@ from backend.db.models import (
     TASK_STATUS_PENDING,
     TASK_STATUS_SUCCESS,
 )
-from backend.schemas import BusinessException, ErrorCode
+from backend.schemas import (
+    BusinessException,
+    ErrorCode,
+    RiskAssessmentSnapshot,
+)
 from backend.validation import validate_copy
 
 
@@ -68,6 +72,7 @@ def mark_success(
     title: str,
     body: str,
     tags: Iterable[str],
+    risk_assessment: RiskAssessmentSnapshot,
     completed_at: datetime,
     image_preview: bytes | None = None,
     image_preview_media_type: str | None = None,
@@ -89,6 +94,7 @@ def mark_success(
         image_preview,
         image_preview_media_type,
     )
+    normalized_risk_assessment = _normalize_risk_assessment(risk_assessment)
 
     result = session.execute(
         update(GenerationRecord)
@@ -104,6 +110,7 @@ def mark_success(
             title=normalized_title,
             content=normalized_body,
             tags=normalized_tags,
+            risk_assessment=normalized_risk_assessment,
             image_path=None,
             image_preview=normalized_preview,
             image_preview_media_type=normalized_preview_media_type,
@@ -234,6 +241,7 @@ def delete_successful(
             title=None,
             content=None,
             tags=None,
+            risk_assessment=None,
             error_code=None,
             error_message=None,
             deleted_at=normalized_deleted_at,
@@ -290,6 +298,19 @@ def _validate_image_preview(
             "历史预览图无效",
         )
     return content, media_type
+
+
+def _normalize_risk_assessment(
+    value: RiskAssessmentSnapshot,
+) -> dict[str, object]:
+    try:
+        snapshot = RiskAssessmentSnapshot.model_validate(value)
+    except Exception:
+        raise BusinessException(
+            ErrorCode.VALIDATION_ERROR,
+            "发布风险快照无效",
+        ) from None
+    return snapshot.model_dump(mode="json")
 
 
 def _matches_preview_signature(content: bytes, media_type: object) -> bool:

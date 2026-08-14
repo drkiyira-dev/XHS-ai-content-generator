@@ -12,6 +12,7 @@ from anyio import to_thread
 from sqlalchemy import text
 
 from backend.core.config import Settings, get_settings
+from backend.schemas import RiskAssessmentSnapshot
 from backend.services.persistence import (
     PendingGeneration,
     SQLAlchemyGenerationPersistence,
@@ -27,6 +28,10 @@ EXPECTED_IMAGE_SUMMARY = "Compose CI 图片摘要"
 EXPECTED_TITLE = "Compose持久化测试"
 EXPECTED_BODY = "这是一条不调用模型的 Compose 持久化测试记录。"
 EXPECTED_TAGS = ("#Compose", "#CI", "#持久化")
+EXPECTED_RISK_ASSESSMENT = RiskAssessmentSnapshot(
+    rule_version="compose-ci-risk-v1",
+    findings=(),
+)
 EXPECTED_SCHEMA_PRIVILEGES = {"SELECT", "INSERT", "UPDATE"}
 EXPECTED_GRANTS = {
     "GRANT USAGE ON *.* TO `xhs_app`@`%`",
@@ -128,6 +133,7 @@ def _assert_expected_record(
     assert record.title == EXPECTED_TITLE
     assert record.body == EXPECTED_BODY
     assert record.tags == EXPECTED_TAGS
+    assert record.risk_assessment == EXPECTED_RISK_ASSESSMENT
 
 
 async def _run(mode: str, generation_id: str | None) -> str | None:
@@ -162,6 +168,7 @@ async def _run(mode: str, generation_id: str | None) -> str | None:
                     title=EXPECTED_TITLE,
                     body=EXPECTED_BODY,
                     tags=EXPECTED_TAGS,
+                    risk_assessment=EXPECTED_RISK_ASSESSMENT,
                 )
             )
         else:

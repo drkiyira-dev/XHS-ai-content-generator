@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { reactive, ref, watch } from 'vue'
+import { ElAlert, ElButton, ElDialog, ElInput } from 'element-plus'
 
 type AuthMode = 'login' | 'register'
 

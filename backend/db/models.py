@@ -296,6 +296,10 @@ class GenerationRecord(Base):
     title: Mapped[str | None] = mapped_column(String(100), nullable=True)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     tags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    risk_assessment: Mapped[dict[str, object] | None] = mapped_column(
+        JSON(none_as_null=True),
+        nullable=True,
+    )
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -338,6 +342,7 @@ class GenerationRecord(Base):
             "content": self.content,
             "body": self.content,
             "tags": list(self.tags) if self.tags is not None else None,
+            "risk_assessment": self.risk_assessment,
             "error_code": self.error_code,
             "error_message": self.error_message,
             "created_at": self.created_at,

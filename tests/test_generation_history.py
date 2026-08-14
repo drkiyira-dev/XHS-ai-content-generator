@@ -17,7 +17,12 @@ from backend.services.persistence import (
     SQLAlchemyGenerationPersistence,
     SuccessfulGeneration,
 )
-from tests.support import build_test_app, make_image_bytes, send_request
+from tests.support import (
+    TEST_RISK_SNAPSHOT,
+    build_test_app,
+    make_image_bytes,
+    send_request,
+)
 
 
 TEST_USER_ID = None
@@ -87,6 +92,7 @@ async def _seed_history(adapter: SQLAlchemyGenerationPersistence) -> None:
                 title=f"历史标题{index + 1}",
                 body=f"历史正文{index + 1}",
                 tags=("#历史", "#生成", f"#版本{index + 1}"),
+                risk_assessment=TEST_RISK_SNAPSHOT,
             )
         )
 
@@ -163,6 +169,7 @@ def test_legacy_history_returns_only_the_explicit_null_owner_partition(
                     title=title,
                     body="测试历史正文",
                     tags=("#历史", "#归属", "#隔离"),
+                    risk_assessment=TEST_RISK_SNAPSHOT,
                 )
             )
 
@@ -299,6 +306,7 @@ def test_authenticated_generation_routes_isolate_users_and_legacy_history(
                     title=title,
                     body="测试历史正文",
                     tags=("#历史", "#归属", "#隔离"),
+                    risk_assessment=TEST_RISK_SNAPSHOT,
                 )
             )
 

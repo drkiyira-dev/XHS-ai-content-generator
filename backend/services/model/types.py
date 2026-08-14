@@ -5,6 +5,11 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.services.image import ProcessedImage
+from backend.validation import (
+    MAX_BODY_LENGTH,
+    MAX_IMAGE_SUMMARY_LENGTH,
+    MAX_TAG_LENGTH,
+)
 
 
 GENERATED_TITLE_MAX_LENGTH = 20
@@ -13,14 +18,21 @@ GENERATED_TITLE_MAX_LENGTH = 20
 class GeneratedCopy(BaseModel):
     """Validated copy returned by a vision-language model."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
 
-    image_summary: str = Field(min_length=1)
+    image_summary: str = Field(
+        min_length=1,
+        max_length=MAX_IMAGE_SUMMARY_LENGTH,
+    )
     title: str = Field(
         min_length=1,
         max_length=GENERATED_TITLE_MAX_LENGTH,
     )
-    body: str = Field(min_length=1)
+    body: str = Field(min_length=1, max_length=MAX_BODY_LENGTH)
     tags: tuple[str, ...] = Field(min_length=3, max_length=5)
 
     @field_validator("image_summary", "title", "body", mode="before")
@@ -49,6 +61,8 @@ class GeneratedCopy(BaseModel):
             tag_text = item.strip().strip("#").strip()
             if not tag_text:
                 raise ValueError("tags must not be empty")
+            if len(f"#{tag_text}") > MAX_TAG_LENGTH:
+                raise ValueError("tags exceed the supported length")
             tag = f"#{tag_text}"
             if tag in seen:
                 raise ValueError("tags must be unique")

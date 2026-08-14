@@ -1,8 +1,103 @@
 // Shared browser boundary for the local FastAPI backend.
 
+const DEFAULT_API_BASE_URL = 'http://127.0.0.1:8000'
+const LOOPBACK_API_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+const URL_SCHEME_PATTERN = /^[a-z][a-z\d+.-]*:\/\//i
+
+/**
+ * Keep this local demonstration from being pointed at an arbitrary remote API.
+ * Validation runs even in Mock mode so an unsafe value cannot remain dormant
+ * and later become active merely by changing VITE_USE_MOCK.
+ */
+export function normalizeLocalApiBaseUrl(value: string | undefined): string {
+  const candidate = value === undefined || value === ''
+    ? DEFAULT_API_BASE_URL
+    : value
+
+  if (candidate !== candidate.trim()) {
+    throw invalidApiBaseUrl()
+  }
+
+  const scheme = candidate.match(URL_SCHEME_PATTERN)
+  if (scheme === null) {
+    throw invalidApiBaseUrl()
+  }
+
+  const authorityStart = scheme[0].length
+  const remainder = candidate.slice(authorityStart)
+  const authorityEndOffset = remainder.search(/[/?#]/)
+  const authority = authorityEndOffset === -1
+    ? remainder
+    : remainder.slice(0, authorityEndOffset)
+  const suffix = authorityEndOffset === -1
+    ? ''
+    : remainder.slice(authorityEndOffset)
+
+  if (
+    authority === '' ||
+    authority.includes('@') ||
+    (suffix !== '' && suffix !== '/')
+  ) {
+    throw invalidApiBaseUrl()
+  }
+
+  let parsed: URL
+  try {
+    parsed = new URL(candidate)
+  } catch {
+    throw invalidApiBaseUrl()
+  }
+
+  const rawHostname = hostnameFromAuthority(authority)
+  if (
+    (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+    !LOOPBACK_API_HOSTS.has(rawHostname) ||
+    !LOOPBACK_API_HOSTS.has(parsed.hostname.toLowerCase()) ||
+    parsed.username !== '' ||
+    parsed.password !== '' ||
+    parsed.pathname !== '/' ||
+    parsed.search !== '' ||
+    parsed.hash !== ''
+  ) {
+    throw invalidApiBaseUrl()
+  }
+
+  return parsed.origin
+}
+
+function hostnameFromAuthority(authority: string): string {
+  if (authority.startsWith('[')) {
+    const closingBracket = authority.indexOf(']')
+    if (closingBracket < 0) {
+      return ''
+    }
+    const port = authority.slice(closingBracket + 1)
+    if (port !== '' && !/^:\d+$/.test(port)) {
+      return ''
+    }
+    return authority.slice(0, closingBracket + 1).toLowerCase()
+  }
+
+  const portSeparator = authority.lastIndexOf(':')
+  if (portSeparator === -1) {
+    return authority.toLowerCase()
+  }
+  const port = authority.slice(portSeparator + 1)
+  if (!/^\d+$/.test(port)) {
+    return ''
+  }
+  return authority.slice(0, portSeparator).toLowerCase()
+}
+
+function invalidApiBaseUrl(): Error {
+  return new Error(
+    'VITE_API_BASE_URL 必须是无凭据、无额外路径的本机 loopback HTTP(S) 地址。'
+  )
+}
+
 export const AUTH_ENABLED = import.meta.env.VITE_AUTH_ENABLED === 'true'
 export const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true'
-export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
+export const API_BASE_URL = normalizeLocalApiBaseUrl(import.meta.env.VITE_API_BASE_URL)
 
 const CSRF_HEADER_NAME = 'X-XHS-CSRF'
 const CSRF_HEADER_VALUE = '1'
